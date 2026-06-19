@@ -1,15 +1,15 @@
+###########################################################################
+# install packages
 packages <- c("dplyr", "ggplot2", "lubridate", "readr", "tidyr", "purrr",
               "scales", "maps", "viridis")
-
 for (p in packages) {
   if (!require(p, character.only = TRUE)) {
     install.packages(p)
     library(p, character.only = TRUE)
   }
 }
-
+#############################################################################
 # read data
-
 data <- readLines("SearchResults.txt", warn = FALSE)
 data <- data[grepl("^\\d{4}/\\d{2}/\\d{2}", data)]
 
@@ -35,7 +35,7 @@ catalog <- catalog %>%
   ) %>%
   filter(!is.na(mag)) %>%
   arrange(datetime)
-
+###############################################################################
 # check data and some exploratory analysis
 cat("Number of events:", nrow(catalog), "\n")
 cat("Time range:", as.character(min(catalog$datetime)), "to",
@@ -44,7 +44,7 @@ cat("Magnitude range:", min(catalog$mag), "to", max(catalog$mag), "\n")
 
 head(catalog)
 summary(catalog$mag)
-
+###############################################################################
 # ============================================================
 # step 1: Estimate catalogue completeness magnitude Mc
 # Methods:
@@ -56,7 +56,6 @@ summary(catalog$mag)
 # ============================================================
 
 # Frequency-Magnitude Distribution
-
 bin_width <- 0.1
 
 make_fmd <- function(mags, bin_width = 0.1) {
@@ -350,7 +349,379 @@ plot_gft_at_mc(
   mc = 1.7,
   bin_width = bin_width
 )
+##############################################################################
+# ============================================================
+# Monte Carlo envelope for GFT / cumulative FMD
+# Test whether high-magnitude deviations are random tail effects
+# ============================================================
 
+gft_monte_carlo_envelope <- function(
+    mags,
+    mc = 1.7,
+    bin_width = 0.1,
+    n_sim = 1000,
+    conf = 0.95,
+    seed = 123
+) {
+  
+  set.seed(seed)
+  
+  mags <- mags[!is.na(mags)]
+  mags_mc <- mags[mags >= mc]
+  
+  n <- length(mags_mc)
+  
+  b_info <- estimate_b_value(mags, mc, bin_width)
+  b <- b_info$b
+  
+  mag_bins <- seq(mc, max(mags_mc), by = bin_width)
+  
+  observed <- sapply(mag_bins, function(m) {
+    sum(mags_mc >= m)
+  })
+  
+  # Theoretical expected cumulative number
+  predicted <- n * 10^(-b * (mag_bins - mc))
+  
+  # Simulate magnitudes from GR distribution:
+  # P(M >= m) = 10^(-b(m - Mc))
+  # If U ~ Uniform(0,1), M = Mc - log10(U)/b
+  sim_cum <- matrix(NA, nrow = length(mag_bins), ncol = n_sim)
+  
+  for (s in 1:n_sim) {
+    u <- runif(n)
+    sim_mags <- mc - log10(u) / b
+    
+    sim_cum[, s] <- sapply(mag_bins, function(m) {
+      sum(sim_mags >= m)
+    })
+  }
+  
+  lower_prob <- (1 - conf) / 2
+  upper_prob <- 1 - lower_prob
+  
+  envelope <- data.frame(
+    mag_bin = mag_bins,
+    observed = observed,
+    predicted = predicted,
+    lower = apply(sim_cum, 1, quantile, probs = lower_prob, na.rm = TRUE),
+    upper = apply(sim_cum, 1, quantile, probs = upper_prob, na.rm = TRUE)
+  )
+  
+  # Check whether observed values are inside the simulation envelope
+  envelope <- envelope %>%
+    mutate(
+      inside_envelope = observed >= lower & observed <= upper,
+      expected_count = predicted
+    )
+  
+  summary <- envelope %>%
+    summarise(
+      mc = mc,
+      n = n,
+      b = b,
+      n_bins = n(),
+      bins_inside = sum(inside_envelope),
+      proportion_inside = mean(inside_envelope),
+      bins_outside = sum(!inside_envelope)
+    )
+  
+  return(list(
+    envelope = envelope,
+    summary = summary,
+    b_info = b_info
+  ))
+}
+
+
+mc_env_1_7 <- gft_monte_carlo_envelope(
+  mags = catalog$mag,
+  mc = 1.7,
+  bin_width = bin_width,
+  n_sim = 1000,
+  conf = 0.95,
+  seed = 123
+)
+
+print(mc_env_1_7$summary)
+##############################################################################
+# ensure if the large number of earthquakes in 2019 will affect the choice of Mc
+# ============================================================
+# Split catalogue into 2019 and non-2019 groups
+# Purpose: test whether 2019 earthquake sequence controls Mc/FMD
+# ============================================================
+
+catalog_fmd_grouped <- catalog %>%
+  filter(!is.na(mag), !is.na(datetime)) %>%
+  mutate(
+    year = lubridate::year(datetime),
+    period_group = ifelse(year == 2019, "2019", "non-2019")
+  )
+
+group_count_summary <- catalog_fmd_grouped %>%
+  count(period_group) %>%
+  mutate(percentage = 100 * n / sum(n))
+
+print(group_count_summary)
+
+write.csv(
+  group_count_summary,
+  "FMD_group_event_counts_2019_vs_non2019.csv",
+  row.names = FALSE
+)
+# ============================================================
+# Incremental FMD comparison: 2019 vs non-2019
+# ============================================================
+
+make_fmd_by_group <- function(df, bin_width = 0.1) {
+  
+  df <- df %>%
+    filter(!is.na(mag), !is.na(period_group))
+  
+  mag_min <- floor(min(df$mag) / bin_width) * bin_width
+  mag_max <- ceiling(max(df$mag) / bin_width) * bin_width
+  
+  mag_bins <- seq(mag_min, mag_max, by = bin_width)
+  
+  fmd_grouped <- df %>%
+    mutate(
+      mag_bin = floor(mag / bin_width) * bin_width
+    ) %>%
+    count(period_group, mag_bin, name = "incremental_count") %>%
+    tidyr::complete(
+      period_group,
+      mag_bin = mag_bins,
+      fill = list(incremental_count = 0)
+    ) %>%
+    group_by(period_group) %>%
+    arrange(mag_bin, .by_group = TRUE) %>%
+    mutate(
+      cumulative_count = purrr::map_dbl(
+        mag_bin,
+        ~ sum(incremental_count[mag_bin >= .x])
+      )
+    ) %>%
+    ungroup()
+  
+  return(fmd_grouped)
+}
+
+fmd_2019_compare <- make_fmd_by_group(
+  df = catalog_fmd_grouped,
+  bin_width = bin_width
+)
+
+p_incremental_2019 <- ggplot(
+  fmd_2019_compare,
+  aes(x = mag_bin, y = incremental_count, linetype = period_group)
+) +
+  geom_line(linewidth = 0.8) +
+  geom_vline(xintercept = 1.7, linetype = "dotted") +
+  scale_y_log10() +
+  labs(
+    title = "Incremental FMD: 2019 vs non-2019",
+    subtitle = "Dotted line indicates Mc = 1.7",
+    x = "Magnitude",
+    y = "Incremental number of events",
+    linetype = "Period"
+  ) +
+  theme_minimal()
+
+print(p_incremental_2019)
+
+ggsave(
+  "Incremental_FMD_2019_vs_non2019.png",
+  p_incremental_2019,
+  width = 8,
+  height = 5,
+  dpi = 300
+)
+# ============================================================
+# Cumulative FMD comparison: 2019 vs non-2019
+# ============================================================
+
+p_cumulative_2019 <- ggplot(
+  fmd_2019_compare,
+  aes(x = mag_bin, y = cumulative_count, linetype = period_group)
+) +
+  geom_line(linewidth = 0.8) +
+  geom_vline(xintercept = 1.7, linetype = "dotted") +
+  scale_y_log10() +
+  labs(
+    title = "Cumulative FMD: 2019 vs non-2019",
+    subtitle = "Dotted line indicates Mc = 1.7",
+    x = "Magnitude",
+    y = "Cumulative number of events",
+    linetype = "Period"
+  ) +
+  theme_minimal()
+
+print(p_cumulative_2019)
+
+ggsave(
+  "Cumulative_FMD_2019_vs_non2019.png",
+  p_cumulative_2019,
+  width = 8,
+  height = 5,
+  dpi = 300
+)
+# ============================================================
+# Normalized cumulative FMD comparison
+# This compares shape rather than total number of events
+# ============================================================
+
+fmd_2019_compare_norm <- fmd_2019_compare %>%
+  group_by(period_group) %>%
+  mutate(
+    cumulative_norm = cumulative_count / max(cumulative_count, na.rm = TRUE)
+  ) %>%
+  ungroup()
+
+p_cumulative_norm_2019 <- ggplot(
+  fmd_2019_compare_norm,
+  aes(x = mag_bin, y = cumulative_norm, linetype = period_group)
+) +
+  geom_line(linewidth = 0.8) +
+  geom_vline(xintercept = 1.7, linetype = "dotted") +
+  scale_y_log10() +
+  labs(
+    title = "Normalized Cumulative FMD: 2019 vs non-2019",
+    subtitle = "Curves are normalized by each group's total event count",
+    x = "Magnitude",
+    y = "Normalized cumulative proportion",
+    linetype = "Period"
+  ) +
+  theme_minimal()
+
+print(p_cumulative_norm_2019)
+
+ggsave(
+  "Normalized_Cumulative_FMD_2019_vs_non2019.png",
+  p_cumulative_norm_2019,
+  width = 8,
+  height = 5,
+  dpi = 300
+)
+# ============================================================
+# b-value and GFT comparison at Mc = 1.7
+# ============================================================
+
+mc_main <- 1.7
+
+fmd_group_quality <- catalog_fmd_grouped %>%
+  group_by(period_group) %>%
+  group_modify(~ {
+    
+    mags_group <- .x$mag
+    
+    b_info <- estimate_b_value(
+      mags = mags_group,
+      mc = mc_main,
+      bin_width = bin_width
+    )
+    
+    gft_info <- gft_at_mc(
+      mags = mags_group,
+      mc = mc_main,
+      bin_width = bin_width
+    )
+    
+    data.frame(
+      n_total = length(mags_group),
+      n_above_mc = sum(mags_group >= mc_main, na.rm = TRUE),
+      mc = mc_main,
+      b = b_info$b,
+      delta_b = b_info$delta_b,
+      gft = gft_info$gft
+    )
+    
+  }) %>%
+  ungroup()
+
+print(fmd_group_quality)
+
+write.csv(
+  fmd_group_quality,
+  "FMD_quality_2019_vs_non2019_at_Mc_1_7.csv",
+  row.names = FALSE
+)
+# ============================================================
+# b-value and GFT comparison at Mc = 1.7
+# ============================================================
+
+mc_main <- 1.7
+
+fmd_group_quality <- catalog_fmd_grouped %>%
+  group_by(period_group) %>%
+  group_modify(~ {
+    
+    mags_group <- .x$mag
+    
+    b_info <- estimate_b_value(
+      mags = mags_group,
+      mc = mc_main,
+      bin_width = bin_width
+    )
+    
+    gft_info <- gft_at_mc(
+      mags = mags_group,
+      mc = mc_main,
+      bin_width = bin_width
+    )
+    
+    data.frame(
+      n_total = length(mags_group),
+      n_above_mc = sum(mags_group >= mc_main, na.rm = TRUE),
+      mc = mc_main,
+      b = b_info$b,
+      delta_b = b_info$delta_b,
+      gft = gft_info$gft
+    )
+    
+  }) %>%
+  ungroup()
+
+print(fmd_group_quality)
+
+write.csv(
+  fmd_group_quality,
+  "FMD_quality_2019_vs_non2019_at_Mc_1_7.csv",
+  row.names = FALSE
+)
+
+# ============================================================
+# Estimate MBS-WW Mc separately for 2019 and non-2019
+# ============================================================
+
+mc_mbs_by_group <- catalog_fmd_grouped %>%
+  group_by(period_group) %>%
+  group_modify(~ {
+    
+    mags_group <- .x$mag
+    
+    mbs_group <- estimate_mbs_ww(
+      mags = mags_group,
+      bin_width = bin_width,
+      delta_m = 0.5
+    )
+    
+    data.frame(
+      n_total = length(mags_group),
+      mc_mbs = mbs_group$mc
+    )
+    
+  }) %>%
+  ungroup()
+
+print(mc_mbs_by_group)
+
+write.csv(
+  mc_mbs_by_group,
+  "MBS_WW_Mc_2019_vs_non2019.csv",
+  row.names = FALSE
+)
+#################################################################
+##############################################################################
 # sensitivity analysis
 mc_main <- 1.7
 
@@ -1342,3 +1713,520 @@ write.csv(
 )
 
 cat("Gardner-Knopoff declustering and ETAS initialization files saved.\n")
+
+# ============================================================
+# Nearest-neighbor declustering
+# Based on Zaliapin & Ben-Zion nearest-neighbor proximity
+# Main catalogue: Mc = 1.7
+# ============================================================
+
+mc_main <- 1.7
+
+catalog_main <- catalog %>%
+  filter(mag >= mc_main) %>%
+  arrange(datetime) %>%
+  mutate(
+    event_index = row_number()
+  )
+
+cat("Catalogue for nearest-neighbor declustering:", nrow(catalog_main), "events\n")
+cat("Magnitude threshold: M >=", mc_main, "\n")
+
+# ============================================================
+# Helper functions
+# ============================================================
+
+# Convert datetime to fractional years
+decimal_year <- function(datetime) {
+  y <- lubridate::year(datetime)
+  start_year <- lubridate::ymd_hms(paste0(y, "-01-01 00:00:00"))
+  start_next <- lubridate::ymd_hms(paste0(y + 1, "-01-01 00:00:00"))
+  
+  y + as.numeric(difftime(datetime, start_year, units = "secs")) /
+    as.numeric(difftime(start_next, start_year, units = "secs"))
+}
+
+# Haversine distance in km
+haversine_km <- function(lon1, lat1, lon2, lat2) {
+  R <- 6371.227
+  
+  lon1 <- lon1 * pi / 180
+  lat1 <- lat1 * pi / 180
+  lon2 <- lon2 * pi / 180
+  lat2 <- lat2 * pi / 180
+  
+  dlon <- lon2 - lon1
+  dlat <- lat2 - lat1
+  
+  a <- sin(dlat / 2)^2 +
+    cos(lat1) * cos(lat2) * sin(dlon / 2)^2
+  
+  c <- 2 * atan2(sqrt(a), sqrt(1 - a))
+  
+  R * c
+}
+
+# Estimate b-value if not already available
+estimate_b_value <- function(mags, mc, bin_width = 0.1) {
+  x <- mags[mags >= mc]
+  n <- length(x)
+  
+  if (n < 30) {
+    return(data.frame(
+      mc = mc,
+      n = n,
+      b = NA,
+      delta_b = NA
+    ))
+  }
+  
+  mean_mag <- mean(x)
+  
+  b <- log10(exp(1)) / (mean_mag - (mc - bin_width / 2))
+  
+  delta_b <- 2.3 * b^2 *
+    sqrt(sum((x - mean_mag)^2) / (n * (n - 1)))
+  
+  data.frame(
+    mc = mc,
+    n = n,
+    b = b,
+    delta_b = delta_b
+  )
+}
+# ============================================================
+# Compute nearest-neighbor parent and eta
+# ============================================================
+
+compute_nearest_neighbor_eta <- function(
+    df,
+    mc = 1.7,
+    b_value = 0.833,
+    d_f = 1.6,
+    use_depth = FALSE,
+    max_lookback_years = 10,
+    max_previous_events = 5000
+) {
+  
+  df <- df %>%
+    arrange(datetime) %>%
+    mutate(
+      event_index = row_number(),
+      decimal_year = decimal_year(datetime),
+      nn_parent_index = NA_integer_,
+      nn_parent_evid = NA,
+      nn_time_years = NA_real_,
+      nn_distance_km = NA_real_,
+      nn_parent_mag = NA_real_,
+      nn_log_eta = NA_real_
+    )
+  
+  n <- nrow(df)
+  
+  for (j in 2:n) {
+    
+    if (j %% 1000 == 0) {
+      cat("Processing event", j, "of", n, "\n")
+    }
+    
+    # Previous events only
+    previous <- 1:(j - 1)
+    
+    # Time difference in years
+    dt_years_all <- df$decimal_year[j] - df$decimal_year[previous]
+    
+    # Limit lookback for computational feasibility
+    previous <- previous[dt_years_all > 0 & dt_years_all <= max_lookback_years]
+    
+    if (length(previous) == 0) next
+    
+    # Limit number of previous events if needed
+    if (length(previous) > max_previous_events) {
+      previous <- tail(previous, max_previous_events)
+    }
+    
+    dt_years <- df$decimal_year[j] - df$decimal_year[previous]
+    dt_years[dt_years <= 0] <- 1 / (365.25 * 24 * 3600)
+    
+    epi_dist_km <- haversine_km(
+      lon1 = df$lon[previous],
+      lat1 = df$lat[previous],
+      lon2 = df$lon[j],
+      lat2 = df$lat[j]
+    )
+    
+    epi_dist_km[epi_dist_km <= 0] <- 0.001
+    
+    if (use_depth) {
+      dz <- df$depth[j] - df$depth[previous]
+      r_km <- sqrt(epi_dist_km^2 + dz^2)
+      r_km[r_km <= 0] <- 0.001
+    } else {
+      r_km <- epi_dist_km
+    }
+    
+    parent_mag <- df$mag[previous]
+    
+    # Nearest-neighbor proximity:
+    # eta_ij = T_ij * R_ij^df * 10^[-b(M_i - Mc)]
+    # We use log10 eta for numerical stability.
+    log_eta <- log10(dt_years) +
+      d_f * log10(r_km) -
+      b_value * (parent_mag - mc)
+    
+    min_id <- which.min(log_eta)
+    parent_idx <- previous[min_id]
+    
+    df$nn_parent_index[j] <- parent_idx
+    df$nn_parent_evid[j] <- df$evid[parent_idx]
+    df$nn_time_years[j] <- dt_years[min_id]
+    df$nn_distance_km[j] <- r_km[min_id]
+    df$nn_parent_mag[j] <- parent_mag[min_id]
+    df$nn_log_eta[j] <- log_eta[min_id]
+  }
+  
+  return(df)
+}
+# ============================================================
+# Classify events using log_eta distribution
+# ============================================================
+
+classify_nn_events <- function(
+    df,
+    stochastic = TRUE,
+    alpha0 = 0,
+    seed = 123
+) {
+  
+  eta_values <- df$nn_log_eta[!is.na(df$nn_log_eta)]
+  
+  if (length(eta_values) < 50) {
+    stop("Too few eta values for classification.")
+  }
+  
+  set.seed(seed)
+  
+  km <- kmeans(eta_values, centers = 2, nstart = 100)
+  
+  centers <- as.numeric(km$centers)
+  
+  clustered_center <- min(centers)
+  background_center <- max(centers)
+  eta_threshold <- mean(centers)
+  
+  df$nn_eta_threshold <- eta_threshold
+  
+  # Deterministic classification
+  df <- df %>%
+    mutate(
+      nn_is_background_det = ifelse(
+        is.na(nn_log_eta),
+        TRUE,
+        nn_log_eta >= eta_threshold
+      ),
+      nn_is_clustered_det = !nn_is_background_det
+    )
+  
+  # Stochastic thinning proxy:
+  # Repository documentation says alternative realizations can be generated using
+  # p = 10^(ad0 + alpha0), where p is used to retain background events.
+  # Here alpha_proxy is centered log_eta relative to the threshold.
+  df <- df %>%
+    mutate(
+      nn_alpha_proxy = nn_log_eta - eta_threshold,
+      nn_background_prob = ifelse(
+        is.na(nn_alpha_proxy),
+        1,
+        pmin(1, pmax(0, 10^(nn_alpha_proxy + alpha0)))
+      )
+    )
+  
+  if (stochastic) {
+    set.seed(seed)
+    df <- df %>%
+      mutate(
+        nn_is_background = runif(n()) < nn_background_prob,
+        nn_is_clustered = !nn_is_background
+      )
+  } else {
+    df <- df %>%
+      mutate(
+        nn_is_background = nn_is_background_det,
+        nn_is_clustered = nn_is_clustered_det,
+        nn_background_prob = ifelse(nn_is_background_det, 1, 0)
+      )
+  }
+  
+  attr(df, "eta_threshold") <- eta_threshold
+  attr(df, "eta_centers") <- centers
+  
+  return(df)
+}
+# ============================================================
+# Build clusters and event labels
+# ============================================================
+
+assign_nn_clusters <- function(df) {
+  
+  df <- df %>%
+    arrange(datetime) %>%
+    mutate(
+      nn_cluster_id = 0L,
+      nn_mainshock_evid = NA,
+      nn_label = "background"
+    )
+  
+  n <- nrow(df)
+  
+  # Build child list for clustered events
+  children <- vector("list", n)
+  
+  for (i in seq_len(n)) {
+    children[[i]] <- integer(0)
+  }
+  
+  for (j in seq_len(n)) {
+    p <- df$nn_parent_index[j]
+    
+    if (!is.na(p) && df$nn_is_clustered[j]) {
+      children[[p]] <- c(children[[p]], j)
+    }
+  }
+  
+  visited <- rep(FALSE, n)
+  cluster_id <- 0L
+  
+  for (i in seq_len(n)) {
+    
+    if (visited[i]) next
+    
+    # Find connected component by parent-child links
+    stack <- i
+    component <- integer(0)
+    
+    while (length(stack) > 0) {
+      v <- stack[1]
+      stack <- stack[-1]
+      
+      if (visited[v]) next
+      
+      visited[v] <- TRUE
+      component <- c(component, v)
+      
+      # Add children
+      stack <- c(stack, children[[v]])
+      
+      # Add parent if event is clustered
+      p <- df$nn_parent_index[v]
+      if (!is.na(p) && df$nn_is_clustered[v]) {
+        stack <- c(stack, p)
+      }
+    }
+    
+    if (length(component) == 1) {
+      idx <- component[1]
+      df$nn_label[idx] <- ifelse(
+        df$nn_is_background[idx],
+        "background",
+        "clustered"
+      )
+      next
+    }
+    
+    cluster_id <- cluster_id + 1L
+    
+    # Mainshock = largest magnitude event in component
+    main_idx <- component[which.max(df$mag[component])]
+    main_time <- df$datetime[main_idx]
+    main_evid <- df$evid[main_idx]
+    
+    df$nn_cluster_id[component] <- cluster_id
+    df$nn_mainshock_evid[component] <- main_evid
+    
+    for (idx in component) {
+      if (idx == main_idx) {
+        df$nn_label[idx] <- "mainshock"
+      } else if (df$datetime[idx] < main_time) {
+        df$nn_label[idx] <- "foreshock"
+      } else {
+        df$nn_label[idx] <- "aftershock"
+      }
+    }
+  }
+  
+  # For ETAS initialization:
+  # background + mainshock are background-like;
+  # foreshock + aftershock are clustered/triggered.
+  df <- df %>%
+    mutate(
+      nn_background_like = nn_label %in% c("background", "mainshock"),
+      nn_init_background_prob = ifelse(nn_background_like, 1, 0)
+    )
+  
+  return(df)
+}
+# ============================================================
+# Run nearest-neighbor declustering
+# ============================================================
+
+# Use b-value from your GFT check if available
+if (exists("gft_check_mbs")) {
+  b_for_nn <- gft_check_mbs$b
+} else {
+  b_for_nn <- estimate_b_value(catalog_main$mag, mc_main)$b
+}
+
+cat("b-value used for NN declustering:", b_for_nn, "\n")
+
+# Parameter df:
+# df = 1.6 is commonly used for epicentral distributions.
+# If you want to follow the repository note for epicenters, keep use_depth = FALSE.
+df_for_nn <- 1.6
+
+nn_raw <- compute_nearest_neighbor_eta(
+  df = catalog_main,
+  mc = mc_main,
+  b_value = b_for_nn,
+  d_f = df_for_nn,
+  use_depth = FALSE,
+  max_lookback_years = 10,
+  max_previous_events = 5000
+)
+
+nn_classified <- classify_nn_events(
+  df = nn_raw,
+  stochastic = FALSE,
+  alpha0 = 0,
+  seed = 123
+)
+
+declust_nn <- assign_nn_clusters(nn_classified)
+
+nn_summary <- declust_nn %>%
+  count(nn_label) %>%
+  mutate(percentage = 100 * n / sum(n))
+
+print(nn_summary)
+
+cat("Nearest-neighbor eta threshold:",
+    attr(nn_classified, "eta_threshold"), "\n")
+
+write.csv(
+  declust_nn,
+  "declustering_nearest_neighbor_ZB_style_Mc_1_7.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  nn_summary,
+  "declustering_nearest_neighbor_ZB_style_summary_Mc_1_7.csv",
+  row.names = FALSE
+)
+# ============================================================
+# Diagnostic plot: log_eta distribution
+# ============================================================
+
+eta_threshold <- attr(nn_classified, "eta_threshold")
+
+p_eta <- ggplot(declust_nn, aes(x = nn_log_eta)) +
+  geom_histogram(bins = 80) +
+  geom_vline(xintercept = eta_threshold, linetype = "dashed") +
+  labs(
+    title = "Nearest-neighbor Declustering Diagnostic",
+    subtitle = "Distribution of log10(eta); dashed line is classification threshold",
+    x = "log10(eta)",
+    y = "Number of events"
+  ) +
+  theme_minimal()
+
+print(p_eta)
+
+ggsave(
+  "nearest_neighbor_log_eta_distribution_Mc_1_7.png",
+  p_eta,
+  width = 8,
+  height = 5,
+  dpi = 300
+)
+# ============================================================
+# Time-magnitude plot
+# ============================================================
+
+p_nn_time <- ggplot(declust_nn, aes(x = datetime, y = mag)) +
+  geom_point(aes(color = nn_label), alpha = 0.5, size = 0.8) +
+  labs(
+    title = "Nearest-neighbor Declustering",
+    subtitle = "Zaliapin-Ben-Zion style nearest-neighbor proximity",
+    x = "Time",
+    y = "Magnitude",
+    color = "Event label"
+  ) +
+  theme_minimal()
+
+print(p_nn_time)
+
+ggsave(
+  "nearest_neighbor_declustering_time_Mc_1_7.png",
+  p_nn_time,
+  width = 9,
+  height = 5,
+  dpi = 300
+)
+# ============================================================
+# Spatial plot
+# ============================================================
+
+p_nn_map <- ggplot(declust_nn, aes(x = lon, y = lat)) +
+  geom_point(aes(color = nn_label), alpha = 0.5, size = 0.8) +
+  coord_fixed() +
+  labs(
+    title = "Spatial Distribution after Nearest-neighbor Declustering",
+    subtitle = "Zaliapin-Ben-Zion style nearest-neighbor proximity",
+    x = "Longitude",
+    y = "Latitude",
+    color = "Event label"
+  ) +
+  theme_minimal()
+
+print(p_nn_map)
+
+ggsave(
+  "nearest_neighbor_declustering_map_Mc_1_7.png",
+  p_nn_map,
+  width = 7,
+  height = 6,
+  dpi = 300
+)
+
+# ============================================================
+# Export ETAS initialization file
+# ============================================================
+
+etas_init_nn <- declust_nn %>%
+  select(
+    evid,
+    datetime,
+    lat,
+    lon,
+    depth,
+    mag,
+    nn_parent_evid,
+    nn_parent_index,
+    nn_time_years,
+    nn_distance_km,
+    nn_parent_mag,
+    nn_log_eta,
+    nn_cluster_id,
+    nn_mainshock_evid,
+    nn_label,
+    nn_background_prob,
+    nn_init_background_prob
+  )
+
+write.csv(
+  etas_init_nn,
+  "etas_initialization_nearest_neighbor_Mc_1_7.csv",
+  row.names = FALSE
+)
+
+cat("Nearest-neighbor declustering and ETAS initialization files saved.\n")
