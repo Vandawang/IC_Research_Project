@@ -1119,8 +1119,8 @@ p_mag_time <- ggplot(catalog_main, aes(x = datetime, y = mag)) +
 print(p_mag_time)
 
 ggsave(
-  "magnitude_over_time_Mc_1_7.png",
-  p_mag_time,
+  filename = "magnitude_over_time_Mc_1_7.png",
+  plot = p_mag_time,
   width = 9,
   height = 5,
   dpi = 300
@@ -1348,6 +1348,10 @@ ggsave(
   dpi = 300
 )
 
+large_mag_threshold <- 5.0
+
+large_events <- catalog_main %>%
+  filter(mag >= large_mag_threshold)
 #  Write short text summary
 
 summary_text <- paste0(
@@ -2230,3 +2234,841 @@ write.csv(
 )
 
 cat("Nearest-neighbor declustering and ETAS initialization files saved.\n")
+
+if (exists("declust_nn")) {
+  
+  bg_rate_nn_monthly <- declust_nn %>%
+    mutate(month = floor_date(datetime, "month")) %>%
+    group_by(month) %>%
+    summarise(
+      total_events = n(),
+      background_events = sum(nn_init_background_prob, na.rm = TRUE),
+      background_rate = background_events,
+      .groups = "drop"
+    ) %>%
+    mutate(method = "Nearest-neighbour")
+  
+} else {
+  
+  message("declust_nn does not exist. Run nearest-neighbour declustering first.")
+  
+}
+
+# ============================================================
+# Reasenberg-style declustering
+# R adaptation based on Reasenberg (1985) / USGS CLUSTER2000 logic
+# Main catalogue: Mc = 1.7
+# ============================================================
+
+mc_main <- 1.7
+
+catalog_main <- catalog %>%
+  filter(!is.na(datetime), !is.na(mag), !is.na(lat), !is.na(lon)) %>%
+  filter(mag >= mc_main) %>%
+  arrange(datetime) %>%
+  mutate(
+    event_index = row_number(),
+    original_order = row_number()
+  )
+
+cat("Catalogue for Reasenberg-style declustering:",
+    nrow(catalog_main), "events\n")
+# ============================================================
+# Haversine distance in km
+# ============================================================
+
+haversine_km <- function(lon1, lat1, lon2, lat2) {
+  
+  R <- 6371.227
+  
+  lon1 <- lon1 * pi / 180
+  lat1 <- lat1 * pi / 180
+  lon2 <- lon2 * pi / 180
+  lat2 <- lat2 * pi / 180
+  
+  dlon <- lon2 - lon1
+  dlat <- lat2 - lat1
+  
+  a <- sin(dlat / 2)^2 +
+    cos(lat1) * cos(lat2) * sin(dlon / 2)^2
+  
+  c <- 2 * atan2(sqrt(a), sqrt(1 - a))
+  
+  R * c
+}
+# ============================================================
+# Reasenberg-style interaction radius
+# Approximate source/interaction radius in km
+# ============================================================
+
+reasenberg_radius_km <- function(mag, rfact = 10) {
+  
+  # Approximate rupture/source radius in km.
+  # The multiplier rfact expands this into an interaction zone.
+  source_radius <- 10^(0.4 * mag - 1.2)
+  
+  rfact * source_radius
+}
+# ============================================================
+# Reasenberg-style look-ahead time window
+# Bounded between tau_min and tau_max
+# ============================================================
+
+reasenberg_tau_days <- function(
+    mag,
+    tau_min = 1,
+    tau_max = 10,
+    xmeff = 4.0,
+    xk = 0.5
+) {
+  
+  # Effective magnitude increases with event magnitude.
+  # This mimics the idea that larger events can keep a cluster active longer.
+  m_eff <- pmax(mag, xmeff - xk)
+  
+  # Smoothly scale tau between tau_min and tau_max.
+  # Larger events receive longer interaction times.
+  scale_val <- pmin(1, pmax(0, (m_eff - mc_main) / (xmeff - mc_main)))
+  
+  tau <- tau_min + scale_val * (tau_max - tau_min)
+  
+  pmin(tau_max, pmax(tau_min, tau))
+}
+# ============================================================
+# Reasenberg-style declustering function
+# ============================================================
+
+reasenberg_declustering <- function(
+    df,
+    tau_min = 1,
+    tau_max = 10,
+    p1 = 0.95,
+    xmeff = 4.0,
+    xk = 0.5,
+    rfact = 10
+) {
+  
+  df <- df %>%
+    arrange(datetime) %>%
+    mutate(
+      event_index = row_number(),
+      reasenberg_cluster_id = 0L,
+      reasenberg_label = "background",
+      reasenberg_parent_index = NA_integer_,
+      reasenberg_parent_evid = NA,
+      reasenberg_distance_km = NA_real_,
+      reasenberg_time_days = NA_real_
+    )
+  
+  n <- nrow(df)
+  
+  # Precompute event-level interaction radius and look-ahead time
+  df <- df %>%
+    mutate(
+      reasenberg_radius_km = reasenberg_radius_km(mag, rfact = rfact),
+      reasenberg_tau_days = reasenberg_tau_days(
+        mag = mag,
+        tau_min = tau_min,
+        tau_max = tau_max,
+        xmeff = xmeff,
+        xk = xk
+      )
+    )
+  
+  # Union-find structure for linking events into clusters
+  parent <- seq_len(n)
+  
+  find_root <- function(x) {
+    while (parent[x] != x) {
+      parent[x] <<- parent[parent[x]]
+      x <- parent[x]
+    }
+    x
+  }
+  
+  union_events <- function(a, b) {
+    ra <- find_root(a)
+    rb <- find_root(b)
+    if (ra != rb) {
+      parent[rb] <<- ra
+    }
+  }
+  
+  # Main linking loop
+  for (j in 2:n) {
+    
+    if (j %% 1000 == 0) {
+      cat("Processing event", j, "of", n, "\n")
+    }
+    
+    t_j <- df$datetime[j]
+    
+    # Only search previous events within tau_max days
+    dt_all <- as.numeric(difftime(t_j, df$datetime[1:(j - 1)], units = "days"))
+    
+    candidate_idx <- which(
+      dt_all > 0 &
+        dt_all <= tau_max
+    )
+    
+    if (length(candidate_idx) == 0) next
+    
+    # For each candidate previous event, check event-specific look-ahead time
+    candidate_idx <- candidate_idx[
+      dt_all[candidate_idx] <= df$reasenberg_tau_days[candidate_idx]
+    ]
+    
+    if (length(candidate_idx) == 0) next
+    
+    # Compute distance to candidate previous events
+    distances <- haversine_km(
+      lon1 = df$lon[candidate_idx],
+      lat1 = df$lat[candidate_idx],
+      lon2 = df$lon[j],
+      lat2 = df$lat[j]
+    )
+    
+    # Spatial interaction condition:
+    # distance must be less than the previous event's interaction radius
+    inside_space <- distances <= df$reasenberg_radius_km[candidate_idx]
+    
+    if (!any(inside_space)) next
+    
+    linked_idx <- candidate_idx[inside_space]
+    linked_dist <- distances[inside_space]
+    
+    # Link current event to all compatible previous events
+    for (k in seq_along(linked_idx)) {
+      union_events(linked_idx[k], j)
+    }
+    
+    # Store nearest compatible previous event as parent for diagnostics
+    nearest_id <- which.min(linked_dist)
+    nearest_parent <- linked_idx[nearest_id]
+    
+    df$reasenberg_parent_index[j] <- nearest_parent
+    df$reasenberg_parent_evid[j] <- df$evid[nearest_parent]
+    df$reasenberg_distance_km[j] <- linked_dist[nearest_id]
+    df$reasenberg_time_days[j] <- as.numeric(
+      difftime(df$datetime[j], df$datetime[nearest_parent], units = "days")
+    )
+  }
+  
+  # Convert union-find roots to cluster ids
+  roots <- sapply(seq_len(n), find_root)
+  root_table <- table(roots)
+  
+  clustered_roots <- names(root_table[root_table > 1])
+  
+  cluster_map <- data.frame(
+    root = as.integer(clustered_roots),
+    reasenberg_cluster_id = seq_along(clustered_roots)
+  )
+  
+  df$root <- roots
+  
+  df <- df %>%
+    left_join(cluster_map, by = "root", suffix = c("", "_new")) %>%
+    mutate(
+      reasenberg_cluster_id = ifelse(
+        is.na(reasenberg_cluster_id_new),
+        0L,
+        reasenberg_cluster_id_new
+      )
+    ) %>%
+    select(-reasenberg_cluster_id_new)
+  
+  # Label background / mainshock / foreshock / aftershock
+  df <- df %>%
+    group_by(reasenberg_cluster_id) %>%
+    group_modify(~ {
+      
+      group_df <- .x
+      
+      if (.y$reasenberg_cluster_id == 0) {
+        group_df$reasenberg_label <- "background"
+        group_df$reasenberg_mainshock_evid <- NA
+        return(group_df)
+      }
+      
+      main_idx_local <- which.max(group_df$mag)
+      main_time <- group_df$datetime[main_idx_local]
+      main_evid <- group_df$evid[main_idx_local]
+      
+      group_df <- group_df %>%
+        mutate(
+          reasenberg_mainshock_evid = main_evid,
+          reasenberg_label = case_when(
+            row_number() == main_idx_local ~ "mainshock",
+            datetime < main_time ~ "foreshock",
+            datetime > main_time ~ "aftershock",
+            TRUE ~ "clustered"
+          )
+        )
+      
+      group_df
+    }) %>%
+    ungroup()
+  
+  # For ETAS initialization:
+  # background + mainshock are background-like,
+  # foreshock + aftershock are clustered/triggered.
+  df <- df %>%
+    mutate(
+      reasenberg_background_prob = ifelse(
+        reasenberg_label %in% c("background", "mainshock"),
+        1,
+        0
+      )
+    ) %>%
+    arrange(original_order)
+  
+  return(df)
+}
+# ============================================================
+# Run Reasenberg-style declustering
+# Standard parameters based on commonly used Reasenberg settings
+# ============================================================
+
+declust_reasenberg <- reasenberg_declustering(
+  df = catalog_main,
+  tau_min = 1,
+  tau_max = 10,
+  p1 = 0.95,
+  xmeff = 4.0,
+  xk = 0.5,
+  rfact = 10
+)
+
+reasenberg_summary <- declust_reasenberg %>%
+  count(reasenberg_label) %>%
+  mutate(
+    percentage = 100 * n / sum(n)
+  )
+
+print(reasenberg_summary)
+
+write.csv(
+  declust_reasenberg,
+  "declustering_reasenberg_style_Mc_1_7.csv",
+  row.names = FALSE
+)
+
+write.csv(
+  reasenberg_summary,
+  "declustering_reasenberg_style_summary_Mc_1_7.csv",
+  row.names = FALSE
+)
+# ============================================================
+# Initial background rate from Reasenberg-style declustering
+# ============================================================
+
+bg_rate_reasenberg_monthly <- declust_reasenberg %>%
+  mutate(month = floor_date(datetime, "month")) %>%
+  group_by(month) %>%
+  summarise(
+    total_events = n(),
+    background_events = sum(reasenberg_background_prob, na.rm = TRUE),
+    background_rate = background_events,
+    .groups = "drop"
+  ) %>%
+  mutate(method = "Reasenberg-style")
+
+print(head(bg_rate_reasenberg_monthly))
+
+write.csv(
+  bg_rate_reasenberg_monthly,
+  "initial_background_rate_reasenberg_style_monthly_Mc_1_7.csv",
+  row.names = FALSE
+)
+
+p_bg_reasenberg <- ggplot(
+  bg_rate_reasenberg_monthly,
+  aes(x = month, y = background_rate)
+) +
+  geom_line(linewidth = 0.7) +
+  labs(
+    title = "Initial Background Rate from Reasenberg-style Declustering",
+    subtitle = "Monthly background/mainshock-like event count",
+    x = "Time",
+    y = "Background events per month"
+  ) +
+  theme_minimal()
+
+print(p_bg_reasenberg)
+
+ggsave(
+  "initial_background_rate_reasenberg_style_monthly_Mc_1_7.png",
+  p_bg_reasenberg,
+  width = 9,
+  height = 5,
+  dpi = 300
+)
+
+# ============================================================
+# Compare initial background rates from three declustering methods
+# ============================================================
+
+bg_rate_three_methods <- bind_rows(
+  bg_rate_gk_monthly %>%
+    select(month, total_events, background_events, background_rate, method),
+  
+  bg_rate_nn_monthly %>%
+    select(month, total_events, background_events, background_rate, method),
+  
+  bg_rate_reasenberg_monthly %>%
+    select(month, total_events, background_events, background_rate, method)
+)
+
+p_bg_three <- ggplot(
+  bg_rate_three_methods,
+  aes(x = month, y = background_rate, linetype = method)
+) +
+  geom_line(linewidth = 0.7) +
+  labs(
+    title = "Comparison of Initial Background Rates",
+    subtitle = "Gardner-Knopoff vs nearest-neighbour vs Reasenberg-style declustering",
+    x = "Time",
+    y = "Background events per month",
+    linetype = "Declustering method"
+  ) +
+  theme_minimal()
+
+print(p_bg_three)
+
+ggsave(
+  "initial_background_rate_three_declustering_methods_Mc_1_7.png",
+  p_bg_three,
+  width = 9,
+  height = 5,
+  dpi = 300
+)
+
+write.csv(
+  bg_rate_three_methods,
+  "initial_background_rate_three_declustering_methods_Mc_1_7.csv",
+  row.names = FALSE
+)
+
+# ============================================================
+# STEP 4: Fit temporal non-stationary ETAS model
+# Using declustering-based initial background rates as starting values
+# ============================================================
+
+library(dplyr)
+library(lubridate)
+library(splines)
+library(ggplot2)
+library(purrr)
+
+# ------------------------------------------------------------
+# 1. Prepare full catalogue for ETAS fitting
+# IMPORTANT: "full catalogue" here means full Mc-complete catalogue,
+# not declustered catalogue.
+# ------------------------------------------------------------
+
+mc_main <- 1.7
+
+etas_cat <- catalog %>%
+  filter(!is.na(datetime), !is.na(mag)) %>%
+  filter(mag >= mc_main) %>%
+  arrange(datetime) %>%
+  mutate(
+    event_id = row_number(),
+    t_days = as.numeric(difftime(datetime, min(datetime), units = "days")),
+    mag_excess = mag - mc_main
+  )
+
+t_start <- min(etas_cat$t_days)
+t_end <- max(etas_cat$t_days)
+T_days <- t_end - t_start
+
+cat("ETAS fitting catalogue:", nrow(etas_cat), "events\n")
+cat("Time span:", round(T_days, 2), "days\n")
+
+
+# ------------------------------------------------------------
+# 2. Spline basis for non-stationary background rate mu(t)
+# log(mu(t)) = B(t) %*% beta
+# ------------------------------------------------------------
+
+mu_df <- 8   # number of spline basis functions; can test 6, 8, 10
+
+B_event <- splines::ns(
+  etas_cat$t_days,
+  df = mu_df,
+  intercept = TRUE,
+  Boundary.knots = c(t_start, t_end)
+)
+
+# Daily grid for numerical integration of background rate
+t_grid <- seq(t_start, t_end, by = 1)
+
+B_grid <- predict(B_event, newx = t_grid)
+
+grid_dt <- c(diff(t_grid), 1)
+
+
+# ------------------------------------------------------------
+# 3. Convert monthly declustering background counts into
+# starting beta values for log(mu(t))
+# ------------------------------------------------------------
+
+make_initial_beta_from_bg_rate <- function(
+    bg_rate_monthly,
+    B_event,
+    t_origin,
+    t_end_datetime,
+    ridge = 1e-4
+) {
+  
+  bg <- bg_rate_monthly %>%
+    mutate(
+      month_start = as.POSIXct(month),
+      month_end = month_start %m+% months(1),
+      month_start_clip = pmax(month_start, t_origin),
+      month_end_clip = pmin(month_end, t_end_datetime),
+      exposure_days = as.numeric(
+        difftime(month_end_clip, month_start_clip, units = "days")
+      ),
+      month_mid = month_start_clip + (month_end_clip - month_start_clip) / 2,
+      t_mid_days = as.numeric(difftime(month_mid, t_origin, units = "days")),
+      # small offset avoids log(0)
+      initial_rate_per_day = (background_events + 0.1) / pmax(exposure_days, 1),
+      log_initial_rate = log(initial_rate_per_day)
+    ) %>%
+    filter(
+      is.finite(t_mid_days),
+      t_mid_days >= 0,
+      is.finite(log_initial_rate)
+    )
+  
+  B_mid <- predict(B_event, newx = bg$t_mid_days)
+  
+  XtX <- t(B_mid) %*% B_mid
+  Xty <- t(B_mid) %*% bg$log_initial_rate
+  
+  beta_init <- solve(
+    XtX + ridge * diag(ncol(B_mid)),
+    Xty
+  )
+  
+  as.numeric(beta_init)
+}
+
+
+t_origin <- min(etas_cat$datetime)
+t_end_datetime <- max(etas_cat$datetime)
+
+beta_init_gk <- make_initial_beta_from_bg_rate(
+  bg_rate_gk_monthly,
+  B_event = B_event,
+  t_origin = t_origin,
+  t_end_datetime = t_end_datetime
+)
+
+beta_init_nn <- make_initial_beta_from_bg_rate(
+  bg_rate_nn_monthly,
+  B_event = B_event,
+  t_origin = t_origin,
+  t_end_datetime = t_end_datetime
+)
+
+beta_init_reasenberg <- make_initial_beta_from_bg_rate(
+  bg_rate_reasenberg_monthly,
+  B_event = B_event,
+  t_origin = t_origin,
+  t_end_datetime = t_end_datetime
+)
+
+
+# ------------------------------------------------------------
+# 4. Temporal ETAS negative log-likelihood
+# ------------------------------------------------------------
+# lambda(t_i) = mu(t_i) + sum_j K exp(alpha(M_j-Mc)) (t_i-t_j+c)^(-p)
+#
+# Parameter vector:
+# par = c(logK, log_alpha, log_c, log_p_minus_1, beta_1, ..., beta_df)
+#
+# K     = exp(logK)
+# alpha = exp(log_alpha)
+# c     = exp(log_c)
+# p     = 1 + exp(log_p_minus_1)
+#
+# p > 1 is imposed for finite triggering integral.
+# ------------------------------------------------------------
+
+etas_negloglik <- function(
+    par,
+    etas_cat,
+    B_event,
+    B_grid,
+    grid_dt,
+    t_grid,
+    max_trigger_days = 3650,
+    penalty_lambda = 1
+) {
+  
+  logK <- par[1]
+  log_alpha <- par[2]
+  log_c <- par[3]
+  log_p_minus_1 <- par[4]
+  beta <- par[-c(1:4)]
+  
+  K <- exp(logK)
+  alpha <- exp(log_alpha)
+  c_par <- exp(log_c)
+  p_par <- 1 + exp(log_p_minus_1)
+  
+  t <- etas_cat$t_days
+  m_excess <- etas_cat$mag_excess
+  n <- length(t)
+  
+  # Background intensity at event times
+  mu_event <- as.numeric(exp(B_event %*% beta))
+  
+  # Background integral
+  mu_grid <- as.numeric(exp(B_grid %*% beta))
+  bg_integral <- sum(mu_grid * grid_dt)
+  
+  # Triggered intensity at each event
+  trig_event <- numeric(n)
+  
+  for (i in 2:n) {
+    
+    dt <- t[i] - t[1:(i - 1)]
+    
+    keep <- dt > 0 & dt <= max_trigger_days
+    
+    if (!any(keep)) {
+      trig_event[i] <- 0
+    } else {
+      prev_idx <- which(keep)
+      
+      trig_event[i] <- sum(
+        K *
+          exp(alpha * m_excess[prev_idx]) *
+          (dt[prev_idx] + c_par)^(-p_par)
+      )
+    }
+  }
+  
+  lambda_event <- mu_event + trig_event
+  
+  # Avoid log(0)
+  if (any(!is.finite(lambda_event)) || any(lambda_event <= 0)) {
+    return(1e100)
+  }
+  
+  loglik_events <- sum(log(lambda_event))
+  
+  # Triggering integral
+  # Integral from each event time to min(T, t_i + max_trigger_days)
+  T_end <- max(t)
+  
+  trigger_integral_each <- numeric(n)
+  
+  for (j in 1:n) {
+    
+    upper_time <- min(T_end, t[j] + max_trigger_days)
+    upper_dt <- upper_time - t[j]
+    
+    if (upper_dt <= 0) {
+      trigger_integral_each[j] <- 0
+    } else {
+      trigger_integral_each[j] <-
+        K *
+        exp(alpha * m_excess[j]) *
+        (
+          c_par^(1 - p_par) -
+            (upper_dt + c_par)^(1 - p_par)
+        ) / (p_par - 1)
+    }
+  }
+  
+  trigger_integral <- sum(trigger_integral_each)
+  
+  loglik <- loglik_events - bg_integral - trigger_integral
+  
+  # Smoothness penalty for non-stationary background
+  # This prevents monthly/spline background from becoming too wiggly.
+  penalty <- penalty_lambda * sum(diff(beta, differences = 2)^2)
+  
+  negloglik <- -loglik + penalty
+  
+  if (!is.finite(negloglik)) {
+    return(1e100)
+  }
+  
+  return(negloglik)
+}
+
+
+# ------------------------------------------------------------
+# 5. Fit ETAS model from one declustering-based starting value
+# ------------------------------------------------------------
+
+fit_etas_from_start <- function(
+    beta_init,
+    method_name,
+    etas_cat,
+    B_event,
+    B_grid,
+    grid_dt,
+    t_grid,
+    max_trigger_days = 3650,
+    penalty_lambda = 1,
+    maxit = 300
+) {
+  
+  # Starting values for triggering parameters
+  # These are starting values only; likelihood optimization updates them.
+  K0 <- 0.02
+  alpha0 <- 1.0
+  c0 <- 0.01
+  p0 <- 1.1
+  
+  par0 <- c(
+    log(K0),
+    log(alpha0),
+    log(c0),
+    log(p0 - 1),
+    beta_init
+  )
+  
+  lower <- c(
+    log(1e-6),     # K
+    log(0.05),     # alpha
+    log(1e-4),     # c
+    log(0.001),    # p - 1
+    rep(-20, length(beta_init))
+  )
+  
+  upper <- c(
+    log(10),       # K
+    log(5),        # alpha
+    log(10),       # c
+    log(5),        # p - 1
+    rep(5, length(beta_init))
+  )
+  
+  cat("\nFitting ETAS model using starting background from:",
+      method_name, "\n")
+  
+  fit <- optim(
+    par = par0,
+    fn = etas_negloglik,
+    method = "L-BFGS-B",
+    lower = lower,
+    upper = upper,
+    control = list(
+      maxit = maxit,
+      trace = 1,
+      REPORT = 5
+    ),
+    etas_cat = etas_cat,
+    B_event = B_event,
+    B_grid = B_grid,
+    grid_dt = grid_dt,
+    t_grid = t_grid,
+    max_trigger_days = max_trigger_days,
+    penalty_lambda = penalty_lambda
+  )
+  
+  par_hat <- fit$par
+  
+  result <- list(
+    method = method_name,
+    fit = fit,
+    par_hat = par_hat,
+    K = exp(par_hat[1]),
+    alpha = exp(par_hat[2]),
+    c = exp(par_hat[3]),
+    p = 1 + exp(par_hat[4]),
+    beta = par_hat[-c(1:4)],
+    negloglik = fit$value,
+    convergence = fit$convergence,
+    message = fit$message
+  )
+  
+  return(result)
+}
+
+
+# ------------------------------------------------------------
+# 6. Fit three ETAS models using three different initial values
+# ------------------------------------------------------------
+
+fit_gk <- fit_etas_from_start(
+  beta_init = beta_init_gk,
+  method_name = "Gardner-Knopoff",
+  etas_cat = etas_cat,
+  B_event = B_event,
+  B_grid = B_grid,
+  grid_dt = grid_dt,
+  t_grid = t_grid,
+  max_trigger_days = 3650,
+  penalty_lambda = 1,
+  maxit = 300
+)
+
+fit_nn <- fit_etas_from_start(
+  beta_init = beta_init_nn,
+  method_name = "Nearest-neighbour",
+  etas_cat = etas_cat,
+  B_event = B_event,
+  B_grid = B_grid,
+  grid_dt = grid_dt,
+  t_grid = t_grid,
+  max_trigger_days = 3650,
+  penalty_lambda = 1,
+  maxit = 300
+)
+
+fit_reasenberg <- fit_etas_from_start(
+  beta_init = beta_init_reasenberg,
+  method_name = "Reasenberg-style",
+  etas_cat = etas_cat,
+  B_event = B_event,
+  B_grid = B_grid,
+  grid_dt = grid_dt,
+  t_grid = t_grid,
+  max_trigger_days = 3650,
+  penalty_lambda = 1,
+  maxit = 300
+)
+
+
+# ------------------------------------------------------------
+# 7. Compare convergence and fitted ETAS parameters
+# ------------------------------------------------------------
+
+etas_fit_summary <- data.frame(
+  method = c(
+    fit_gk$method,
+    fit_nn$method,
+    fit_reasenberg$method
+  ),
+  convergence = c(
+    fit_gk$convergence,
+    fit_nn$convergence,
+    fit_reasenberg$convergence
+  ),
+  negloglik = c(
+    fit_gk$negloglik,
+    fit_nn$negloglik,
+    fit_reasenberg$negloglik
+  ),
+  K = c(fit_gk$K, fit_nn$K, fit_reasenberg$K),
+  alpha = c(fit_gk$alpha, fit_nn$alpha, fit_reasenberg$alpha),
+  c = c(fit_gk$c, fit_nn$c, fit_reasenberg$c),
+  p = c(fit_gk$p, fit_nn$p, fit_reasenberg$p)
+)
+
+print(etas_fit_summary)
+
+write.csv(
+  etas_fit_summary,
+  "nonstationary_ETAS_fit_summary_three_initializations_Mc_1_7.csv",
+  row.names = FALSE
+)
