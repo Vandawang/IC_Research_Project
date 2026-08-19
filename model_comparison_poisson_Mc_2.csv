@@ -1,0 +1,2 @@
+"model","n_events","duration_days","lambda_per_day","logLik","k","AIC","BIC"
+"Homogeneous Poisson",15207,9496.29152268519,1.60136195942098,-8046.7157432336,1,16095.4314864672,16103.0609975943

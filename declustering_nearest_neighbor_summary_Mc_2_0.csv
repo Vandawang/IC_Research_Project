@@ -1,0 +1,5 @@
+"nn_label","n","percentage","method"
+"aftershock",8933,58.7426842901295,"Nearest-neighbour"
+"background",3765,24.7583349773131,"Nearest-neighbour"
+"foreshock",1701,11.1856381929375,"Nearest-neighbour"
+"mainshock",808,5.31334253961991,"Nearest-neighbour"
