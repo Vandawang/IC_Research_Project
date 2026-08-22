@@ -1,0 +1,4 @@
+"method","n_total","n_background_like","n_clustered","background_fraction","background_percentage"
+"Gardner-Knopoff",15207,2599,12608,0.170908134411784,17.0908134411784
+"Nearest-neighbour",15207,4573,10634,0.30071677516933,30.071677516933
+"Reasenberg-style",15207,3847,11360,0.252975603340567,25.2975603340567

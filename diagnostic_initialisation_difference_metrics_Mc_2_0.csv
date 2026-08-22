@@ -1,0 +1,4 @@
+"method_1","method_2","MAE","RMSE","correlation"
+"Gardner-Knopoff","Nearest-neighbour",0.209137779573869,0.323622541727725,0.490221490546307
+"Gardner-Knopoff","Reasenberg-style",0.133038205135886,0.17996054597355,0.68666264150152
+"Nearest-neighbour","Reasenberg-style",0.0912361758344338,0.185345575558411,0.841030426888277

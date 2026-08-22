@@ -1,13 +1,10 @@
-###########################################################################
 # install packages
 packages <- c("dplyr", "ggplot2", "lubridate", "readr", "tidyr", "purrr",
-              "scales", "maps", "viridis","SAPP","mclust")
+              "scales", "maps", "viridis","SAPP","mclust","splines")
 for (p in packages) {
   if (!require(p, character.only = TRUE)) {
     install.packages(p)
     library(p, character.only = TRUE)}}
-
-#############################################################################
 # read data
 data <- readLines("SearchResults.txt", warn = FALSE)
 data <- data[grepl("^\\d{4}/\\d{2}/\\d{2}", data)]
@@ -17,7 +14,7 @@ names(catalog) <- c("date", "time", "event_type", "geo_type","mag", "mag_type",
 catalog <- catalog %>%
   mutate(datetime = ymd_hms(paste(date, time)),mag = as.numeric(mag),
          lat = as.numeric(lat),lon = as.numeric(lon),depth = as.numeric(depth)) %>%
-  filter(!is.na(mag)) %>%
+  filter(!is.na(mag), !is.na(datetime), !is.na(lat), !is.na(lon), !is.na(depth)) %>%
   arrange(datetime)
 # check data and some exploratory analysis
 cat("Number of events:", nrow(catalog), "\n")
@@ -27,15 +24,151 @@ cat("Magnitude range:", min(catalog$mag), "to", max(catalog$mag), "\n")
 
 head(catalog)
 summary(catalog$mag)
-###############################################################################
-# step 1: Estimate catalogue completeness magnitude Mc
-# Methods:
-# 1. FMD plot
-# 2. MAXC
-# 3. MBS-WW
-# 4. GFT-95% / GFT-90%
-# 5. Mc sensitivity thresholds
+# ============================================================
+# STEP 1: EDA and model comparison
+# ============================================================
+catalog_main <- catalog %>%
+  mutate(date_only = as.Date(datetime),year = year(datetime),
+         month = floor_date(datetime, "month"),year_month = format(datetime, "%Y-%m")) %>%
+  arrange(datetime)
+# Annual event counts
+annual_counts <- catalog_main %>%
+  group_by(year) %>%
+  summarise(n_events = n(),max_mag = max(mag, na.rm = TRUE),
+            mean_mag = mean(mag, na.rm = TRUE),median_mag = median(mag, na.rm = TRUE),
+            .groups = "drop")
 
+print(annual_counts)
+write.csv(annual_counts,"annual_event_counts.csv",row.names = FALSE)
+
+p_annual <- ggplot(annual_counts, aes(x = year, y = n_events)) +
+  geom_col() +
+  labs(title = "Annual Number of Earthquakes",x = "Year",y = "Number of events") +
+  theme_minimal()
+
+print(p_annual)
+ggsave("annual_event_counts.png",p_annual,width = 8,height = 5,dpi = 300)
+
+# Monthly event counts
+monthly_counts <- catalog_main %>%
+  group_by(month) %>%
+  summarise(n_events = n(),max_mag = max(mag, na.rm = TRUE),
+            mean_mag = mean(mag, na.rm = TRUE),
+            .groups = "drop")
+
+print(head(monthly_counts))
+write.csv(monthly_counts,"monthly_event_counts.csv",row.names = FALSE)
+
+p_monthly <- ggplot(monthly_counts, aes(x = month, y = n_events)) +
+  geom_line(linewidth = 0.6) +
+  geom_point(size = 1) +
+  labs(title = "Monthly Number of Earthquakes",x = "Time",y = "Number of events") +
+  theme_minimal()
+
+print(p_monthly)
+ggsave("monthly_event_counts.png",p_monthly,width = 9,height = 5,dpi = 300)
+
+# Cumulative event count through time
+catalog_cum <- catalog_main %>%
+  arrange(datetime) %>%
+  mutate(cumulative_events = row_number())
+
+p_cumulative <- ggplot(catalog_cum, aes(x = datetime, y = cumulative_events)) +
+  geom_line(linewidth = 0.7) +
+  labs(title = "Cumulative Number of Earthquakes over Time",
+       subtitle = "Steeper segments indicate periods of increased seismic activity",
+       x = "Time",y = "Cumulative number of events") +
+  theme_minimal()
+
+print(p_cumulative)
+ggsave("cumulative_event_count.png",p_cumulative,width = 9,height = 5,dpi = 300)
+
+# Daily Event Counts around the Largest Event
+largest_event <- catalog_main %>%
+  arrange(desc(mag)) %>%
+  slice(1)
+print(largest_event)
+mainshock_time <- largest_event$datetime[1]
+window_days <- 30
+catalog_around_mainshock <- catalog_main %>%
+  filter(datetime >= mainshock_time - days(window_days),
+         datetime <= mainshock_time + days(window_days)) %>%
+  mutate(days_from_mainshock = as.numeric(difftime(datetime, mainshock_time, units = "days")))
+daily_around_mainshock <- catalog_around_mainshock %>%
+  mutate(relative_day = floor(days_from_mainshock)) %>%
+  group_by(relative_day) %>%
+  summarise(n_events = n(), max_mag = max(mag, na.rm = TRUE),
+            .groups = "drop")
+p_around_daily <- ggplot(daily_around_mainshock, aes(x = relative_day, y = n_events)) +
+  geom_col() +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  labs(title = "Daily Event Counts around the Largest Event",
+       subtitle = paste0("Largest event: M = ",largest_event$mag),
+       x = "Days from largest event",
+       y = "Number of events") +
+  theme_minimal()
+print(p_around_daily)
+ggsave("daily_counts_around_largest_event_Mc_2.png",p_around_daily,width = 8,
+       height = 5,dpi = 300)
+
+# Spatial distribution map
+catalog_main_spatial <- catalog_main %>%
+  mutate(period_group = ifelse(year(datetime) == 2019,"2019","non-2019"))
+
+usa_map <- map_data("state")
+california_map <- usa_map %>%
+  filter(region == "california")
+
+p_spatial_map <- ggplot() +
+  geom_polygon(data = california_map,
+               aes(x = long, y = lat,group = group),
+               fill = "gray95",color = "gray60") +
+  geom_point(data = catalog_main_spatial,
+             aes(x = lon, y = lat,size = mag,color = period_group),
+             alpha = 0.45) +
+  coord_fixed(xlim = c(min(catalog_main_spatial$lon, na.rm = TRUE) - 0.2,
+                       max(catalog_main_spatial$lon, na.rm = TRUE) + 0.2),
+              ylim = c(min(catalog_main_spatial$lat, na.rm = TRUE) - 0.2,
+                       max(catalog_main_spatial$lat, na.rm = TRUE) + 0.2)) +
+  scale_size_continuous(range = c(0.5, 4)) +
+  labs(title = "Spatial Distribution of Earthquakes",
+       subtitle = "Point size represents magnitude; color distinguishes 2019 from other years",
+    x = "Longitude", y = "Latitude",size = "Magnitude",color = "Period") +
+  theme_minimal()
+
+print(p_spatial_map)
+ggsave("spatial_distribution_2019_vs_non2019.png",
+       p_spatial_map,width = 8,height = 6,dpi = 300)
+catalog_non2019 <- catalog_main_spatial %>%
+  filter(period_group == "non-2019")
+
+catalog_2019 <- catalog_main_spatial %>%
+  filter(period_group == "2019")
+
+p_spatial_map <- ggplot() +
+  geom_polygon(data = california_map,
+               aes(x = long,y = lat,group = group),
+               fill = "gray95",
+               color = "gray60") +
+  geom_point(data = catalog_non2019,
+             aes(x = lon,y = lat,size = mag,color = period_group),alpha = 0.25) +
+  geom_point(data = catalog_2019,
+             aes(x = lon,y = lat,size = mag,color = period_group),alpha = 0.65) +
+  coord_fixed(xlim = c(min(catalog_main_spatial$lon, na.rm = TRUE) - 0.2,
+                       max(catalog_main_spatial$lon, na.rm = TRUE) + 0.2),
+              ylim = c(min(catalog_main_spatial$lat, na.rm = TRUE) - 0.2,
+                       max(catalog_main_spatial$lat, na.rm = TRUE) + 0.2)) +
+  scale_size_continuous(range = c(0.5, 4)) +
+  labs(title = "Spatial Distribution of Earthquakes",
+       subtitle = "Magnitude shown by point size; 2019 events highlighted",
+       x = "Longitude",y = "Latitude",size = "Magnitude",color = "Period") +
+  theme_minimal()
+
+print(p_spatial_map)
+ggsave("spatial_distribution_2019_vs_non2019.png",p_spatial_map,width = 8,height = 6,dpi = 300)
+# ============================================================
+# step 2: Estimate Mc
+# ============================================================
 # Frequency-Magnitude Distribution
 bin_width <- 0.1
 make_fmd <- function(mags, bin_width = 0.1) {
@@ -44,14 +177,12 @@ make_fmd <- function(mags, bin_width = 0.1) {
   max_m <- ceiling(max(mags) / bin_width) * bin_width
   bins <- seq(min_m, max_m, by = bin_width)
   fmd <- data.frame(mag_bin = bins) %>%
-    mutate(
-      count = sapply(mag_bin, function(m) {
-        sum(mags >= m & mags < m + bin_width)}),
+    mutate(count = sapply(mag_bin, function(m) {
+      sum(mags >= m & mags < m + bin_width)}),
       cumulative_count = sapply(mag_bin, function(m) {
         sum(mags >= m)})) %>%
     filter(cumulative_count > 0)
   return(fmd)}
-
 fmd <- make_fmd(catalog$mag, bin_width)
 
 # Incremental FMD
@@ -74,36 +205,25 @@ p2 <- ggplot(fmd, aes(x = mag_bin, y = cumulative_count)) +
 print(p1)
 print(p2)
 
-# MAXC method (reference)
-estimate_maxc <- function(mags, bin_width = 0.1) {
-  fmd <- make_fmd(mags, bin_width)
-  maxc <- fmd$mag_bin[which.max(fmd$count)]
-  return(maxc)}
-mc_maxc <- estimate_maxc(catalog$mag, bin_width)
-cat("MAXC Mc =", mc_maxc, "\n")
-
-#  b-value MLE with magnitude bin correction （used for GFT and MBS-WW）
+#  b-value MLE
 estimate_b_value <- function(mags, mc, bin_width = 0.1) {
   x <- mags[mags >= mc]
   n <- length(x)
   if (n < 30) {
     return(data.frame(mc = mc,n = n,b = NA,delta_b = NA))}
   mean_mag <- mean(x)
-  # Utsu / Aki MLE with bin correction
   b <- log10(exp(1)) / (mean_mag - (mc - bin_width / 2))
-  # Shi & Bolt uncertainty
   delta_b <- 2.3 * b^2 * sqrt(sum((x - mean_mag)^2) / (n * (n - 1)))
   return(data.frame(mc = mc,n = n,b = b,delta_b = delta_b))}
 
-# MBS-WW method
+# MBS-WW
 estimate_mbs_ww <- function(mags, bin_width = 0.1, delta_m = 0.5) {
   mags <- mags[!is.na(mags)]
   candidates <- seq(floor(min(mags) / bin_width) * bin_width,
                     floor(max(mags) / bin_width) * bin_width - delta_m,
                     by = bin_width)
-  b_table <- purrr::map_dfr(
-    candidates,
-    ~ estimate_b_value(mags, .x, bin_width))
+  b_table <- purrr::map_dfr(candidates,
+                            ~ estimate_b_value(mags, .x, bin_width))
   b_table <- b_table %>%
     filter(!is.na(b))
   mbs_table <- b_table %>%
@@ -137,15 +257,13 @@ ggplot(mbs$table, aes(x = mc, y = b)) +
   labs(title = "MBS-WW b-value Stability Method",x = "Candidate Mc",y = "b-value") +
   theme_minimal()
 
-# GFT check at MBS-WW Mc
+# GFT check
 gft_at_mc <- function(mags, mc, bin_width = 0.1) {
   mags <- mags[!is.na(mags)]
   x <- mags[mags >= mc]
   if (length(x) < 50) {
     warning("Too few events above this Mc.")
     return(data.frame(mc = mc,n = length(x),b = NA,gft = NA))}
-  
-  # Estimate b-value at this Mc
   b_info <- estimate_b_value(mags, mc, bin_width)
   b <- b_info$b
   
@@ -153,15 +271,10 @@ gft_at_mc <- function(mags, mc, bin_width = 0.1) {
     warning("b-value could not be estimated.")
     return(data.frame(mc = mc,n = length(x),b = NA,gft = NA))}
   
-  # Magnitude bins above Mc
   mag_bins <- seq(mc, max(mags), by = bin_width)
-  # Observed cumulative FMD
   obs <- sapply(mag_bins, function(m) {sum(mags >= m)})
-  # Predicted cumulative FMD under Gutenberg-Richter law
   pred <- obs[1] * 10^(-b * (mag_bins - mc))
-  # Goodness-of-fit value
   gft <- 100 - (sum(abs(obs - pred)) / sum(obs)) * 100
-  # Return table for this Mc
   result <- data.frame(mc = mc,n = length(x),b = b,gft = gft)
   
   return(result)
@@ -182,7 +295,6 @@ if (gft_check_mbs$gft >= 95) {
 }
 
 # Plot observed vs predicted cumulative FMD at Mc = 1.7
-
 plot_gft_at_mc <- function(mags, mc, bin_width = 0.1) {
   mags <- mags[!is.na(mags)]
   b_info <- estimate_b_value(mags, mc, bin_width)
@@ -206,10 +318,9 @@ plot_gft_at_mc <- function(mags, mc, bin_width = 0.1) {
   }
 
 plot_gft_at_mc(mags = catalog$mag,mc = 1.7,bin_width = bin_width)
-##############################################################################
+
 # Monte Carlo envelope for GFT / cumulative FMD
 # Test whether high-magnitude deviations are random tail effects
-
 gft_monte_carlo_envelope <- function(mags,mc = 1.7,bin_width = 0.1,n_sim = 1000,
                                      conf = 0.95,seed = 123) {
   set.seed(seed)
@@ -220,13 +331,8 @@ gft_monte_carlo_envelope <- function(mags,mc = 1.7,bin_width = 0.1,n_sim = 1000,
   b <- b_info$b
   mag_bins <- seq(mc, max(mags_mc), by = bin_width)
   observed <- sapply(mag_bins, function(m) {sum(mags_mc >= m)})
-  
-  # Theoretical expected cumulative number
   predicted <- n * 10^(-b * (mag_bins - mc))
-  
-  # Simulate magnitudes from GR distribution:
-  # P(M >= m) = 10^(-b(m - Mc))
-  # If U ~ Uniform(0,1), M = Mc - log10(U)/b
+
   sim_cum <- matrix(NA, nrow = length(mag_bins), ncol = n_sim)
   
   for (s in 1:n_sim) {
@@ -240,13 +346,11 @@ gft_monte_carlo_envelope <- function(mags,mc = 1.7,bin_width = 0.1,n_sim = 1000,
   
   lower_prob <- (1 - conf) / 2
   upper_prob <- 1 - lower_prob
-  
   envelope <- data.frame(mag_bin = mag_bins,observed = observed,
                          predicted = predicted,
                          lower = apply(sim_cum, 1, quantile, probs = lower_prob, na.rm = TRUE),
                          upper = apply(sim_cum, 1, quantile, probs = upper_prob, na.rm = TRUE))
-  
-  # Check whether observed values are inside the simulation envelope
+
   envelope <- envelope %>%
     mutate(inside_envelope = observed >= lower & observed <= upper,
            expected_count = predicted)
@@ -254,7 +358,6 @@ gft_monte_carlo_envelope <- function(mags,mc = 1.7,bin_width = 0.1,n_sim = 1000,
   summary <- envelope %>%
     summarise(mc = mc,n = n,b = b,n_bins = n(),bins_inside = sum(inside_envelope),
               proportion_inside = mean(inside_envelope),bins_outside = sum(!inside_envelope))
-  
   return(list(envelope = envelope,summary = summary,b_info = b_info))
 }
 
@@ -262,27 +365,19 @@ gft_monte_carlo_envelope <- function(mags,mc = 1.7,bin_width = 0.1,n_sim = 1000,
 mc_env_1_7 <- gft_monte_carlo_envelope(mags = catalog$mag,mc = 1.7,bin_width = bin_width,
                                        n_sim = 1000,conf = 0.95,seed = 123)
 print(mc_env_1_7$summary)
-##############################################################################
 # ensure if the large number of earthquakes in 2019 will affect the choice of Mc
-# ============================================================
 # Split catalogue into 2019 and non-2019 groups
-# Purpose: test whether 2019 earthquake sequence controls Mc/FMD
-
 catalog_fmd_grouped <- catalog %>%
-  filter(!is.na(mag), !is.na(datetime)) %>%
   mutate(year = lubridate::year(datetime),
          period_group = ifelse(year == 2019, "2019", "non-2019"))
 group_count_summary <- catalog_fmd_grouped %>%
   count(period_group) %>%
   mutate(percentage = 100 * n / sum(n))
 print(group_count_summary)
-
 write.csv(group_count_summary,"FMD_group_event_counts_2019_vs_non2019.csv",
           row.names = FALSE)
-# ============================================================
-# Incremental FMD comparison: 2019 vs non-2019
-# ============================================================
 
+# Incremental FMD comparison: 2019 vs non-2019
 make_fmd_by_group <- function(df, bin_width = 0.1) {
   df <- df %>%
     filter(!is.na(mag), !is.na(period_group))
@@ -318,9 +413,8 @@ print(p_incremental_2019)
 
 ggsave("Incremental_FMD_2019_vs_non2019.png",p_incremental_2019,width = 8,height = 5,
        dpi = 300)
-# ============================================================
+
 # Cumulative FMD comparison: 2019 vs non-2019
-# ============================================================
 p_cumulative_2019 <- ggplot(fmd_2019_compare,
                             aes(x = mag_bin, y = cumulative_count, linetype = period_group)) +
   geom_line(linewidth = 0.8) +
@@ -332,10 +426,8 @@ p_cumulative_2019 <- ggplot(fmd_2019_compare,
   theme_minimal()
 print(p_cumulative_2019)
 ggsave("Cumulative_FMD_2019_vs_non2019.png",p_cumulative_2019,width = 8,height = 5,dpi = 300)
-# ============================================================
+
 # Normalized cumulative FMD comparison
-# This compares shape rather than total number of events
-# ============================================================
 fmd_2019_compare_norm <- fmd_2019_compare %>%
   group_by(period_group) %>%
   mutate(cumulative_norm = cumulative_count / max(cumulative_count, na.rm = TRUE)) %>%
@@ -353,9 +445,8 @@ p_cumulative_norm_2019 <- ggplot(fmd_2019_compare_norm,
 print(p_cumulative_norm_2019)
 ggsave("Normalized_Cumulative_FMD_2019_vs_non2019.png",p_cumulative_norm_2019,width = 8,
        height = 5,dpi = 300)
-# ============================================================
+
 # b-value and GFT comparison at Mc = 1.7
-# ============================================================
 mc_main <- 1.7
 fmd_group_quality <- catalog_fmd_grouped %>%
   group_by(period_group) %>%
@@ -368,13 +459,10 @@ fmd_group_quality <- catalog_fmd_grouped %>%
                mc = mc_main,b = b_info$b,delta_b = b_info$delta_b,gft = gft_info$gft)
   }) %>%
   ungroup()
-
 print(fmd_group_quality)
 write.csv(fmd_group_quality,"FMD_quality_2019_vs_non2019_at_Mc_1_7.csv",row.names = FALSE)
 
-# ============================================================
 # Estimate MBS-WW Mc separately for 2019 and non-2019
-# ============================================================
 mc_mbs_by_group <- catalog_fmd_grouped %>%
   group_by(period_group) %>%
   group_modify(~ {
@@ -386,24 +474,17 @@ mc_mbs_by_group <- catalog_fmd_grouped %>%
 print(mc_mbs_by_group)
 write.csv( mc_mbs_by_group,"MBS_WW_Mc_2019_vs_non2019.csv",row.names = FALSE)
 
-# ============================================================
 # Temporal Mc analysis using rolling event windows
 # check if mc changed a lot during 2019
-# ============================================================
-window_size <- 1000     # number of earthquakes per window
-step_size   <- 250      # move forward by 250 events each time
+window_size <- 1000 
+step_size   <- 250     
 bin_width   <- 0.1
-
-# Optional fixed Mc values for comparison
 mc_check_values <- c(1.7, 2.0)
-
 catalog_temporal <- catalog %>%
   filter(!is.na(datetime), !is.na(mag)) %>%
   arrange(datetime)
-
 n_events <- nrow(catalog_temporal)
 window_starts <- seq(from = 1,to = n_events - window_size + 1,by = step_size)
-# Estimate Mc and b-value in each rolling window
 temporal_mc_results <- purrr::map_dfr(window_starts,function(start_idx) {
     end_idx <- start_idx + window_size - 1
     temp <- catalog_temporal[start_idx:end_idx, ]
@@ -425,7 +506,6 @@ temporal_mc_results <- purrr::map_dfr(window_starts,function(start_idx) {
                n_above_2_0 = b_20$n,b_at_2_0 = b_20$b, delta_b_2_0 = b_20$delta_b)
   }
 )
-
 print(head(temporal_mc_results))
 
 # Plot temporal Mc
@@ -448,7 +528,6 @@ p_temporal_mc <- ggplot(temporal_mc_long,
   theme_minimal()
 
 print(p_temporal_mc)
-
 p_temporal_mc_2019 <- ggplot(temporal_mc_long,
                              aes(x = center_time,y = mc,linetype = method )) +
   geom_line(linewidth = 0.8) +
@@ -480,13 +559,9 @@ p_b_temporal <- ggplot(temporal_mc_results,
   theme_minimal()
 
 print(p_b_temporal)
-
 write.csv( temporal_mc_results,"Temporal_Mc_Rolling_Window.csv",row.names = FALSE)
-
 ggsave("Temporal_Mc_Rolling_Window.png", p_temporal_mc,width = 10,height = 5,dpi = 300)
-
 ggsave("Temporal_Mc_2019_Highlight.png", p_temporal_mc_2019, width = 10,height = 5, dpi = 300)
-
 ggsave("Temporal_b_value_Mc_2_0.png",p_b_temporal,width = 10, height = 5,dpi = 300)
 temporal_mc_results %>%
   filter( year(center_time) == 2019,mc_maxc >= 1.7 | mc_mbs >= 1.7) %>%
@@ -494,276 +569,729 @@ temporal_mc_results %>%
          b_at_2_0) %>%
   arrange(center_time)
 
-#################################################################
-##############################################################################
-# sensitivity analysis
+
+# ============================================================
+# STEP 3: Declustering and ETAS initialization
+# ============================================================
+# Methods
+# A. Gardner-Knopoff window declustering
+# B. Zaliapin-Ben-Zion-style nearest-neighbour cluster declustering
+# C. Reasenberg-style interaction-link declustering
+
+`%||%` <- function(x, y) if (is.null(x) || length(x)==0 || all(is.na(x))) y else x
+
 mc_main <- 2.0
+bin_width <- 0.1
+mc_tag <- gsub("\\.", "_", sprintf("%.1f", mc_main))
 
-mc_sensitivity <- c(2.0, 2.5)
+catalog_main <- catalog %>%
+  filter( mag >= mc_main) %>%
+  arrange(datetime) %>%
+  mutate(event_index = row_number(), original_order = row_number(), year = year(datetime))
 
-for (mc in mc_sensitivity) {
-  
-  temp_cat <- catalog %>%
-    filter(mag >= mc)
-  
-  out_name <- paste0(
-    "catalog_for_etas_Mc_",
-    gsub("\\.", "_", mc),
-    ".csv"
-  )
-  
-  write.csv(temp_cat, out_name, row.names = FALSE)
-  
-  cat(
-    "Saved:", out_name,
-    "with", nrow(temp_cat),
-    "events; threshold: M >=", mc, "\n"
-  )
+stopifnot(all(catalog_main$mag >= mc_main))
+cat("Main declustering catalogue: Mc =", mc_main, "; N =", nrow(catalog_main), "\n")
+
+haversine_km <- function(lon1, lat1, lon2, lat2) {
+  R <- 6371.227
+  lon1 <- lon1*pi/180; lat1 <- lat1*pi/180
+  lon2 <- lon2*pi/180; lat2 <- lat2*pi/180
+  dlon <- lon2-lon1; dlat <- lat2-lat1
+  a <- sin(dlat/2)^2 + cos(lat1)*cos(lat2)*sin(dlon/2)^2
+  R * 2 * atan2(sqrt(a), sqrt(1-a))
 }
 
-# Summary table
-mc_sensitivity_summary <- data.frame(
-  mc_threshold = mc_sensitivity,
-  n_events = sapply(mc_sensitivity, function(mc) {
-    sum(catalog$mag >= mc)
-  })
-)
+decimal_year <- function(datetime) {
+  tz <- attr(datetime, "tzone") %||% "UTC"
+  y <- year(datetime)
+  y0 <- as.POSIXct(paste0(y,"-01-01 00:00:00"), tz=tz)
+  y1 <- as.POSIXct(paste0(y+1,"-01-01 00:00:00"), tz=tz)
+  y + as.numeric(difftime(datetime,y0,units="secs")) /
+    as.numeric(difftime(y1,y0,units="secs"))
+}
 
-print(mc_sensitivity_summary)
+estimate_b_value_local <- function(mags, mc, bin_width=0.1) {
+  x <- mags[is.finite(mags) & mags >= mc]
+  n <- length(x)
+  if (n < 30) return(data.frame(mc=mc,n=n,b=NA,delta_b=NA))
+  mean_mag <- mean(x)
+  b <- log10(exp(1))/(mean_mag-(mc-bin_width/2))
+  delta_b <- 2.3*b^2*sqrt(sum((x-mean_mag)^2)/(n*(n-1)))
+  data.frame(mc=mc,n=n,b=b,delta_b=delta_b)
+}
 
-write.csv(
-  mc_sensitivity_summary,
-  "mc_sensitivity_event_counts.csv",
-  row.names = FALSE
-)
+b_info_declustering <- estimate_b_value_local(catalog_main$mag, mc_main, bin_width)
+b_catalogue <- b_info_declustering$b
+cat("b-value estimated at Mc=2.0:", b_catalogue, "\n")
+
+save_csv_mc <- function(x, stem) {
+  f <- paste0(stem,"_Mc_",mc_tag,".csv")
+  write.csv(x,f,row.names=FALSE); invisible(f)
+}
+save_plot_mc <- function(p, stem, width=9, height=5, dpi=300) {
+  f <- paste0(stem,"_Mc_",mc_tag,".png")
+  ggsave(f,p,width=width,height=height,dpi=dpi); invisible(f)
+}
+
+#  A. GARDNER-KNOPOFF
+gk_space_window_km <- function(M) 10^(0.1238*M + 0.983)
+gk_time_window_days <- function(M) ifelse(M < 6.5,
+                                          10^(0.5409*M - 0.547), 10^(0.032*M + 2.7389))
+
+gardner_knopoff_declustering <- function(df, fs_time_prop=1.0, time_cutoff_days=NULL) {
+  stopifnot(fs_time_prop>=0, fs_time_prop<=1)
+  d0 <- df %>% arrange(datetime) %>%
+    mutate(original_order=row_number(),
+           gk_space_window_km=gk_space_window_km(mag),
+           gk_time_window_days=gk_time_window_days(mag))
+  if (!is.null(time_cutoff_days))
+    d0$gk_time_window_days <- pmin(d0$gk_time_window_days,time_cutoff_days)
+  
+  d <- d0 %>% arrange(desc(mag),datetime)
+  n <- nrow(d)
+  d$gk_cluster_id <- 0L; d$gk_flag <- 0L
+  d$gk_parent_evid <- NA; d$gk_parent_mag <- NA_real_
+  cid <- 0L
+  
+  if (n>=2) for (i in seq_len(n-1)) {
+    if (i%%1000==0) cat("GK",i,"/",n,"\n")
+    if (d$gk_cluster_id[i]!=0L) next
+    dt <- as.numeric(difftime(d$datetime,d$datetime[i],units="days"))
+    keep_t <- d$gk_cluster_id==0L &
+      dt >= -d$gk_time_window_days[i]*fs_time_prop &
+      dt <= d$gk_time_window_days[i]
+    idx <- which(keep_t); if (length(idx)<=1) next
+    dist <- haversine_km(d$lon[idx],d$lat[idx],d$lon[i],d$lat[i])
+    inside <- idx[dist <= d$gk_space_window_km[i]]
+    if (length(setdiff(inside,i))==0) next
+    cid <- cid+1L
+    d$gk_cluster_id[inside] <- cid
+    d$gk_flag[inside] <- 1L
+    d$gk_flag[inside[dt[inside]<0]] <- -1L
+    d$gk_flag[i] <- 0L
+    nonmain <- setdiff(inside,i)
+    d$gk_parent_evid[nonmain] <- d$evid[i]
+    d$gk_parent_mag[nonmain] <- d$mag[i]
+  }
+  
+  d %>% arrange(original_order) %>% mutate(
+    gk_label=case_when(
+      gk_cluster_id==0L ~ "background",
+      gk_cluster_id!=0L & gk_flag==0L ~ "mainshock",
+      gk_flag==1L ~ "aftershock",
+      gk_flag==-1L ~ "foreshock",
+      TRUE ~ "unknown"),
+    gk_is_background_like=gk_label %in% c("background","mainshock"),
+    gk_background_prob=as.numeric(gk_is_background_like))
+}
+
+gk_fs_baseline <- 1.0
+declust_gk <- gardner_knopoff_declustering(catalog_main,gk_fs_baseline)
+gk_summary <- declust_gk %>% count(gk_label,name="n") %>%
+  mutate(percentage=100*n/sum(n),method="Gardner-Knopoff")
+print(gk_summary)
+save_csv_mc(declust_gk,"declustering_gardner_knopoff")
+save_csv_mc(gk_summary,"declustering_gardner_knopoff_summary")
+
+etas_init_gk <- declust_gk %>% select(
+  evid,datetime,lat,lon,depth,mag,gk_cluster_id,gk_flag,gk_label,
+  gk_is_background_like,gk_background_prob,gk_parent_evid,gk_parent_mag,
+  gk_space_window_km,gk_time_window_days)
+save_csv_mc(etas_init_gk,"etas_initialization_gardner_knopoff")
+
+# B. ZALIAPIN-BEN-ZION-STYLE NEAREST NEIGHBOUR
+compute_nearest_neighbor_eta <- function(df,mc,b_value,d_f=1.6,use_depth=FALSE,
+                                         max_lookback_years=Inf,max_previous_events=Inf) {
+  d <- df %>% arrange(datetime) %>% mutate(
+    event_index=row_number(),decimal_year=decimal_year(datetime),
+    nn_parent_index=NA_integer_,nn_parent_evid=NA,
+    nn_time_years=NA_real_,nn_distance_km=NA_real_,
+    nn_parent_mag=NA_real_,nn_log_eta=NA_real_)
+  n <- nrow(d)
+  if (n>=2) for (j in 2:n) {
+    if (j%%1000==0) cat("NN",j,"/",n,"\n")
+    prev <- seq_len(j-1)
+    dtall <- d$decimal_year[j]-d$decimal_year[prev]
+    keep <- dtall>0
+    if (is.finite(max_lookback_years)) keep <- keep & dtall<=max_lookback_years
+    prev <- prev[keep]; if (!length(prev)) next
+    if (is.finite(max_previous_events) && length(prev)>max_previous_events)
+      prev <- tail(prev,as.integer(max_previous_events))
+    dt <- d$decimal_year[j]-d$decimal_year[prev]
+    dt[dt<=0] <- 1/(365.25*24*3600)
+    epi <- haversine_km(d$lon[prev],d$lat[prev],d$lon[j],d$lat[j])
+    epi[epi<=0] <- 0.001
+    r <- if (use_depth) sqrt(epi^2+(d$depth[j]-d$depth[prev])^2) else epi
+    r[r<=0] <- 0.001
+    pm <- d$mag[prev]
+    logeta <- log10(dt)+d_f*log10(r)-b_value*(pm-mc)
+    q <- which.min(logeta); parent <- prev[q]
+    d$nn_parent_index[j] <- parent; d$nn_parent_evid[j] <- d$evid[parent]
+    d$nn_time_years[j] <- dt[q]; d$nn_distance_km[j] <- r[q]
+    d$nn_parent_mag[j] <- pm[q]; d$nn_log_eta[j] <- logeta[q]
+  }
+  d
+}
+
+fit_nn_mixture_threshold <- function(log_eta,seed=123) {
+  x <- log_eta[is.finite(log_eta)]
+  if (length(x)<100) stop("Too few finite eta values")
+  set.seed(seed)
+  fit <- mclust::Mclust(x,G=2,modelNames=c("E","V"),verbose=FALSE)
+  grid <- seq(quantile(x,.001),quantile(x,.999),length.out=4000)
+  pr <- predict(fit,newdata=grid)
+  thr <- if (!is.null(pr$z) && ncol(pr$z)==2)
+    grid[which.min(abs(pr$z[,1]-pr$z[,2]))] else mean(fit$parameters$mean)
+  list(fit=fit,threshold=thr,means=sort(as.numeric(fit$parameters$mean)))
+}
+
+classify_nn_clusters <- function(df,threshold) {
+  d <- df %>% arrange(datetime) %>% mutate(
+    nn_is_clustered_edge=ifelse(is.na(nn_log_eta),FALSE,nn_log_eta<threshold),
+    nn_cluster_id=0L,nn_mainshock_evid=NA,nn_label="background")
+  n <- nrow(d); adj <- vector("list",n); for(i in seq_len(n)) adj[[i]] <- integer(0)
+  for(j in seq_len(n)) {
+    p <- d$nn_parent_index[j]
+    if (!is.na(p) && d$nn_is_clustered_edge[j]) {
+      adj[[j]] <- unique(c(adj[[j]],p)); adj[[p]] <- unique(c(adj[[p]],j))
+    }
+  }
+  visited <- rep(FALSE,n); cid <- 0L
+  for(i in seq_len(n)) {
+    if (visited[i]) next
+    stack <- i; comp <- integer(0)
+    while(length(stack)) {
+      v <- stack[1]; stack <- stack[-1]
+      if (visited[v]) next
+      visited[v] <- TRUE; comp <- c(comp,v); stack <- unique(c(stack,adj[[v]]))
+    }
+    if (length(comp)==1) next
+    cid <- cid+1L
+    m <- comp[which.max(d$mag[comp])]; mt <- d$datetime[m]; me <- d$evid[m]
+    d$nn_cluster_id[comp] <- cid; d$nn_mainshock_evid[comp] <- me
+    for(k in comp) d$nn_label[k] <- if(k==m) "mainshock" else if(d$datetime[k]<mt) "foreshock" else "aftershock"
+  }
+  d %>% mutate(nn_is_background_like=nn_label %in% c("background","mainshock"),
+               nn_background_prob=as.numeric(nn_is_background_like))
+}
+
+nn_df_baseline <- 1.6
+nn_raw <- compute_nearest_neighbor_eta(catalog_main,mc_main,b_catalogue,nn_df_baseline,
+                                       use_depth=FALSE,max_lookback_years=Inf,max_previous_events=Inf)
+nn_mix <- fit_nn_mixture_threshold(nn_raw$nn_log_eta)
+nn_eta_threshold <- nn_mix$threshold
+cat("NN: d_f=",nn_df_baseline," b=",b_catalogue," threshold=",nn_eta_threshold,"\n")
+declust_nn <- classify_nn_clusters(nn_raw,nn_eta_threshold)
+nn_summary <- declust_nn %>% count(nn_label,name="n") %>%
+  mutate(percentage=100*n/sum(n),method="Nearest-neighbour")
+print(nn_summary)
+save_csv_mc(declust_nn,"declustering_nearest_neighbor")
+save_csv_mc(nn_summary,"declustering_nearest_neighbor_summary")
+
+etas_init_nn <- declust_nn %>% select(
+  evid,datetime,lat,lon,depth,mag,nn_parent_evid,nn_parent_index,
+  nn_time_years,nn_distance_km,nn_parent_mag,nn_log_eta,nn_cluster_id,
+  nn_mainshock_evid,nn_label,nn_is_background_like,nn_background_prob)
+save_csv_mc(etas_init_nn,"etas_initialization_nearest_neighbor")
+
+p_nn_eta <- ggplot(declust_nn %>% filter(is.finite(nn_log_eta)),aes(nn_log_eta))+
+  geom_histogram(bins=80)+geom_vline(xintercept=nn_eta_threshold,linetype="dashed")+
+  labs(title="Nearest-neighbour proximity distribution",
+       subtitle="Two-component Gaussian-mixture threshold",
+       x=expression(log[10](eta)),y="Number of events")+theme_minimal()
+print(p_nn_eta); save_plot_mc(p_nn_eta,"nearest_neighbor_log_eta_distribution",8,5)
+
+# REASENBERG-STYLE INTERACTION-LINK DECLUSTERING
+
+reas_baseline <- list(tau_min = 1,tau_max = 10,p1 = 0.95,xk = 0.5,xmeff = 4.0,rfact= 10)
+
+haversine_km <- function(lon1, lat1, lon2, lat2) {
+  earth_radius_km <- 6371.227
+  lon1_rad <- lon1 * pi / 180
+  lat1_rad <- lat1 * pi / 180
+  lon2_rad <- lon2 * pi / 180
+  lat2_rad <- lat2 * pi / 180
+  
+  dlon <- lon2_rad - lon1_rad
+  dlat <- lat2_rad - lat1_rad
+  
+  a <- sin(dlat / 2)^2 + cos(lat1_rad) *cos(lat2_rad) *sin(dlon / 2)^2
+  central_angle <- 2 * atan2(sqrt(a),sqrt(1 - a))
+  earth_radius_km * central_angle
+}
+
+reasenberg_crack_radius_km <- function(magnitude) {
+  10^(0.4 * magnitude - 1.2)
+}
+
+reasenberg_interaction_radius_km <- function(magnitude,rfact = 10) {
+  rfact *reasenberg_crack_radius_km(magnitude)
+}
+
+reasenberg_tau <- function(cluster_max_mag,elapsed_days,tau_min = 1,tau_max = 10,
+                           p1 = 0.95,xmeff = 4.0,xk = 0.5) {
+  effective_cutoff <- xmeff +xk *pmax(cluster_max_mag - xmeff,0)
+  delta_m <- pmax(cluster_max_mag - effective_cutoff,0)
+  base_time <- pmax(elapsed_days,tau_min)
+  tau_raw <- -log(1 - p1) *base_time /10^(2 * (delta_m - 1) / 3)
+  tau_bounded <- pmin(tau_max,pmax(tau_min,tau_raw))
+  tau_bounded
+}
+
+haversine_km <- function(lon1, lat1, lon2, lat2) {
+  R <- 6371.227
+  lon1 <- lon1 * pi / 180
+  lat1 <- lat1 * pi / 180
+  lon2 <- lon2 * pi / 180
+  lat2 <- lat2 * pi / 180
+  
+  dlon <- lon2 - lon1
+  dlat <- lat2 - lat1
+  
+  a <- sin(dlat / 2)^2 +cos(lat1) * cos(lat2) * sin(dlon / 2)^2
+  2 * R * atan2(sqrt(a), sqrt(1 - a))
+}
+
+reasenberg_crack_radius_km <- function(magnitude) {
+  10^(0.4 * magnitude - 1.2)
+}
+
+reasenberg_interaction_radius_km <- function(magnitude,rfact = 10) {
+  rfact *reasenberg_crack_radius_km(magnitude)
+}
+
+reasenberg_tau <- function(cluster_max_mag,elapsed_days,tau_min = 1,tau_max = 10,
+                           p1 = 0.95,xmeff = 4.0,xk = 0.5) {
+  effective_cutoff <- xmeff +xk * pmax(cluster_max_mag - xmeff,0)
+  delta_m <- pmax(cluster_max_mag - effective_cutoff,0)
+  base_time <- pmax(elapsed_days,tau_min)
+  tau_raw <- -log(1 - p1) *base_time /10^(2 * (delta_m - 1) / 3)
+  pmin(tau_max,pmax(tau_min, tau_raw))
+}
+
+assign_reasenberg_labels <- function(d,roots) {
+  root_counts <- table(roots)
+  clustered_roots <- as.integer(names(root_counts[root_counts > 1]))
+  cluster_id_map <- setNames(seq_along(clustered_roots),clustered_roots)
+  
+  d$reasenberg_cluster_id <- ifelse(roots %in% clustered_roots,
+                                    unname( cluster_id_map[as.character(roots)]),
+                                    0L)
+  
+  d$reasenberg_label <- "background"
+  d$reasenberg_mainshock_evid <- NA
+  
+  cluster_ids <- sort(unique(d$reasenberg_cluster_id[d$reasenberg_cluster_id > 0]))
+  
+  for (cluster_id in cluster_ids) {
+    cluster_idx <- which(d$reasenberg_cluster_id == cluster_id)
+    
+    mainshock_idx <- cluster_idx[which.max(d$mag[cluster_idx])]
+    mainshock_time <-d$datetime[mainshock_idx]
+    mainshock_evid <-d$evid[mainshock_idx]
+    d$reasenberg_mainshock_evid[cluster_idx] <- mainshock_evid
+    labels <- ifelse(d$datetime[cluster_idx] <mainshock_time,"foreshock",
+                     "aftershock")
+    
+    labels[cluster_idx == mainshock_idx] <- "mainshock"
+    
+    d$reasenberg_label[cluster_idx] <- labels
+  }
+  
+  d$reasenberg_is_background_like <-
+    d$reasenberg_label %in%
+    c("background", "mainshock")
+  
+  d$reasenberg_background_prob <-as.numeric(d$reasenberg_is_background_like)
+  
+  d
+}
+
+reasenberg_style_declustering_fast <- function(df,tau_min = 1,tau_max = 10,p1 = 0.95,
+                                               xk = 0.5,xmeff = 4.0, rfact = 10,progress_every = 1000) {
+  d <- df %>%
+    arrange(datetime)
+  n_events <- nrow(d)
+  
+  if (n_events == 0) {
+    return(d)
+  }
+  
+  d$reasenberg_parent_index <- NA_integer_
+  d$reasenberg_parent_evid <- NA
+  d$reasenberg_distance_km <- NA_real_
+  d$reasenberg_time_days <- NA_real_
+  
+  catalogue_start <- min(d$datetime)
+  
+  time_days <- as.numeric(difftime(d$datetime,
+                                   catalogue_start,
+                                   units = "days"))
+  
+  uf_parent <- seq_len(n_events)
+  uf_size <- rep(1L, n_events)
+  
+  cluster_max_mag <- d$mag
+  cluster_start_day <- time_days
+  
+  find_root <- function(x) {
+    
+    while (uf_parent[x] != x) {
+      uf_parent[x] <<-uf_parent[ uf_parent[x] ]
+      x <- uf_parent[x]
+    }
+    
+    x
+  }
+  
+  union_clusters <- function(a, b) {
+    
+    root_a <- find_root(a)
+    root_b <- find_root(b)
+    
+    if (root_a == root_b) {
+      return(root_a)
+    }
+    
+    if (uf_size[root_a] < uf_size[root_b]) {
+      temp <- root_a
+      root_a <- root_b
+      root_b <- temp
+    }
+    
+    uf_parent[root_b] <<- root_a
+    
+    uf_size[root_a] <<- uf_size[root_a] +uf_size[root_b]
+    
+    cluster_max_mag[root_a] <<- max( cluster_max_mag[root_a],cluster_max_mag[root_b])
+    
+    cluster_start_day[root_a] <<- min(cluster_start_day[root_a],cluster_start_day[root_b])
+    
+    root_a
+  }
+  
+  left_idx <- 1L
+  
+  for (j in 2:n_events) {
+    
+    if (
+      progress_every > 0 &&
+      j %% progress_every == 0
+    ) {
+      cat(sprintf("Reasenberg-fast: %d / %d\n",j, n_events))
+    }
+    
+    while (
+      left_idx < j &&
+      time_days[j] -
+      time_days[left_idx] >
+      tau_max
+    ) {
+      left_idx <- left_idx + 1L
+    }
+    
+    if (left_idx >= j) {
+      next
+    }
+    
+    candidate_idx <- left_idx:(j - 1L)
+    linked_idx <- integer(length(candidate_idx))
+    linked_dist <- numeric( length(candidate_idx) )
+    
+    n_linked <- 0L
+    
+    for (i in candidate_idx) {
+      cluster_root <- find_root(i)
+      elapsed_days <- time_days[i] -cluster_start_day[ cluster_root]
+      tau_i <- reasenberg_tau(cluster_max_mag =cluster_max_mag[ cluster_root],
+                              elapsed_days =elapsed_days,tau_min =tau_min,
+                              tau_max =tau_max,p1 = p1, xmeff =xmeff,xk =xk)
+      
+      dt_ij <- time_days[j] -time_days[i]
+      
+      if (dt_ij > tau_i) {
+        next
+      }
+      
+      distance_ij <- haversine_km(d$lon[i],d$lat[i], d$lon[j], d$lat[j])
+      interaction_radius <-reasenberg_interaction_radius_km(d$mag[i], rfact )
+      
+      if (
+        distance_ij <=interaction_radius
+      ) {
+        n_linked <- n_linked + 1L
+        linked_idx[n_linked] <- i
+        linked_dist[n_linked] <- distance_ij
+      }
+    }
+    
+    if (n_linked == 0L) {
+      next
+    }
+    
+    linked_idx <-linked_idx[seq_len(n_linked)]
+    linked_dist <-linked_dist[seq_len(n_linked)]
+    for (parent_idx in linked_idx) {
+      union_clusters( parent_idx,j)
+    }
+    
+    nearest_pos <- which.min(linked_dist)
+    parent_idx <- linked_idx[ nearest_pos]
+    
+    d$reasenberg_parent_index[j] <-parent_idx
+    d$reasenberg_parent_evid[j] <- d$evid[parent_idx]
+    d$reasenberg_distance_km[j] <-linked_dist[nearest_pos]
+    d$reasenberg_time_days[j] <-time_days[j] - time_days[parent_idx]}
+  
+  roots <- integer(n_events)
+  
+  for (i in seq_len(n_events)) {
+    roots[i] <- find_root(i)
+  }
+  
+  d <- assign_reasenberg_labels( d,roots)
+  return(d)
+}
+
+reas_start_time <- Sys.time()
+
+declust_reasenberg <- reasenberg_style_declustering_fast(df =catalog_main,
+                                                         tau_min =reas_baseline$tau_min,
+                                                         tau_max =reas_baseline$tau_max,
+                                                         p1 =reas_baseline$p1,
+                                                         xk =reas_baseline$xk,
+                                                         xmeff =reas_baseline$xmeff,
+                                                         rfact =reas_baseline$rfact,
+                                                         progress_every =1000)
+
+reas_runtime_minutes <- as.numeric(difftime(Sys.time(),reas_start_time,units = "mins"))
+cat(sprintf("\nReasenberg runtime: %.2f minutes\n",reas_runtime_minutes))
+
+reasenberg_summary <-declust_reasenberg %>%
+  count(reasenberg_label,name = "n") %>%
+  mutate(percentage =100 *n /sum(n), method = "Reasenberg-style")
+print(reasenberg_summary)
+
+
+# ETAS initialisation output
+etas_init_reasenberg <- declust_reasenberg %>%
+  select(evid,datetime,lat,lon,depth, mag,reasenberg_cluster_id,
+         reasenberg_parent_index,reasenberg_parent_evid,reasenberg_distance_km,
+         reasenberg_time_days,reasenberg_mainshock_evid,reasenberg_label,
+         reasenberg_is_background_like,reasenberg_background_prob)
+
+save_csv_mc(declust_reasenberg,"declustering_reasenberg_style")
+save_csv_mc(reasenberg_summary, "declustering_reasenberg_style_summary")
+save_csv_mc(etas_init_reasenberg, "etas_initialization_reasenberg_style")
+
+# Sanity checks
+stopifnot(nrow(declust_reasenberg) ==nrow(catalog_main))
+stopifnot(all(declust_reasenberg$mag >=2.0))
+cat(sprintf("N events: %d\n",nrow(declust_reasenberg)))
+cat(sprintf("Background-like fraction: %.4f\n",
+            mean(declust_reasenberg$reasenberg_is_background_like)))
+
+#HARMONISE EVENT-LEVEL OUTPUTS
+event_level_compare <- catalog_main %>% select(evid,datetime,mag,lat,lon,year) %>%
+  left_join(declust_gk %>% select(evid,gk_label,gk_is_background_like),by="evid") %>%
+  left_join(declust_nn %>% select(evid,nn_label,nn_is_background_like),by="evid") %>%
+  left_join(declust_reasenberg %>% select(evid,reasenberg_label,reasenberg_is_background_like),by="evid")
+stopifnot(nrow(event_level_compare)==nrow(catalog_main))
+stopifnot(!anyNA(event_level_compare[c("gk_is_background_like","nn_is_background_like","reasenberg_is_background_like")]))
+save_csv_mc(event_level_compare,"declustering_event_level_comparison")
+
+# DIAGNOSTIC 1: OVERALL BACKGROUND FRACTION
+overall_background_summary <- bind_rows(
+  data.frame(method="Gardner-Knopoff",n_total=nrow(event_level_compare),
+             n_background_like=sum(event_level_compare$gk_is_background_like)),
+  data.frame(method="Nearest-neighbour",n_total=nrow(event_level_compare),
+             n_background_like=sum(event_level_compare$nn_is_background_like)),
+  data.frame(method="Reasenberg-style",n_total=nrow(event_level_compare),
+             n_background_like=sum(event_level_compare$reasenberg_is_background_like))) %>%
+  mutate(n_clustered=n_total-n_background_like,
+         background_fraction=n_background_like/n_total,
+         background_percentage=100*background_fraction)
+print(overall_background_summary)
+save_csv_mc(overall_background_summary,"diagnostic_overall_background_fraction")
+
+# DIAGNOSTIC 2: EVENT-LEVEL AGREEMENT
+binary_jaccard <- function(x,y) { u<-sum(x|y); if(u==0) NA_real_ else sum(x&y)/u }
+cohen_kappa_binary <- function(x,y) {
+  x<-as.integer(x); y<-as.integer(y); po<-mean(x==y)
+  pe<-mean(x==1)*mean(y==1)+mean(x==0)*mean(y==0)
+  if(abs(1-pe)<1e-12) NA_real_ else (po-pe)/(1-pe)
+}
+agreement_pair <- function(x,y,m1,m2) data.frame(
+  method_1=m1,method_2=m2,raw_agreement=mean(x==y),
+  jaccard_background=binary_jaccard(x,y),kappa=cohen_kappa_binary(x,y),
+  n_disagree=sum(x!=y),disagreement_percentage=100*mean(x!=y))
+
+pairwise_agreement <- bind_rows(
+  agreement_pair(event_level_compare$gk_is_background_like,event_level_compare$nn_is_background_like,
+                 "Gardner-Knopoff","Nearest-neighbour"),
+  agreement_pair(event_level_compare$gk_is_background_like,event_level_compare$reasenberg_is_background_like,
+                 "Gardner-Knopoff","Reasenberg-style"),
+  agreement_pair(event_level_compare$nn_is_background_like,event_level_compare$reasenberg_is_background_like,
+                 "Nearest-neighbour","Reasenberg-style"))
+print(pairwise_agreement)
+save_csv_mc(pairwise_agreement,"diagnostic_pairwise_event_agreement")
+
+event_level_disagreement <- event_level_compare %>% mutate(
+  n_background_votes=as.integer(gk_is_background_like)+as.integer(nn_is_background_like)+as.integer(reasenberg_is_background_like),
+  unanimous=n_background_votes %in% c(0,3),any_disagreement=!unanimous)
+disagreement_summary <- event_level_disagreement %>% summarise(
+  n_total=n(),n_unanimous=sum(unanimous),n_disagreement=sum(any_disagreement),
+  disagreement_percentage=100*mean(any_disagreement))
+print(disagreement_summary)
+save_csv_mc(event_level_disagreement,"diagnostic_event_level_disagreement")
+save_csv_mc(disagreement_summary,"diagnostic_event_level_disagreement_summary")
+
+# DIAGNOSTIC 3: 2019 VS NON-2019
+period_summary <- event_level_compare %>% mutate(period_group=ifelse(year==2019,"2019","non-2019")) %>%
+  group_by(period_group) %>% summarise(
+    n_total=n(),
+    gk_background=sum(gk_is_background_like),gk_background_fraction=mean(gk_is_background_like),
+    nn_background=sum(nn_is_background_like),nn_background_fraction=mean(nn_is_background_like),
+    reasenberg_background=sum(reasenberg_is_background_like),reasenberg_background_fraction=mean(reasenberg_is_background_like),
+    all_three_background=sum(gk_is_background_like&nn_is_background_like&reasenberg_is_background_like),
+    all_three_clustered=sum(!gk_is_background_like&!nn_is_background_like&!reasenberg_is_background_like),
+    any_method_disagreement=sum((as.integer(gk_is_background_like)+as.integer(nn_is_background_like)+as.integer(reasenberg_is_background_like)) %in% c(1,2)),
+    disagreement_fraction=any_method_disagreement/n_total,.groups="drop")
+print(period_summary)
+save_csv_mc(period_summary,"diagnostic_2019_vs_non2019_declustering")
+
+agreement_by_period <- event_level_compare %>% mutate(period_group=ifelse(year==2019,"2019","non-2019")) %>%
+  group_split(period_group) %>% map_dfr(function(z) bind_rows(
+    agreement_pair(z$gk_is_background_like,z$nn_is_background_like,"Gardner-Knopoff","Nearest-neighbour"),
+    agreement_pair(z$gk_is_background_like,z$reasenberg_is_background_like,"Gardner-Knopoff","Reasenberg-style"),
+    agreement_pair(z$nn_is_background_like,z$reasenberg_is_background_like,"Nearest-neighbour","Reasenberg-style")) %>%
+      mutate(period_group=unique(z$period_group)))
+print(agreement_by_period)
+save_csv_mc(agreement_by_period,"diagnostic_pairwise_agreement_2019_vs_non2019")
+
+#  MONTHLY ETAS INITIAL BACKGROUND RATE (events/day)
+monthly_background_rate <- function(df,background_col,method_name) {
+  tmp <- df %>% mutate(month=floor_date(datetime,"month"),bg=as.numeric(.data[[background_col]])) %>%
+    group_by(month) %>% summarise(total_events=n(),background_events=sum(bg),.groups="drop")
+  full <- tibble(month=seq(floor_date(min(catalog_main$datetime),"month"),
+                           floor_date(max(catalog_main$datetime),"month"),by="month"))
+  full %>% left_join(tmp,by="month") %>% mutate(
+    total_events=replace_na(total_events,0),background_events=replace_na(background_events,0),
+    days_in_month=days_in_month(month),
+    background_rate_per_day=background_events/days_in_month,
+    background_count_per_month=background_events,method=method_name)
+}
+
+bg_rate_gk_monthly <- monthly_background_rate(declust_gk,"gk_is_background_like","Gardner-Knopoff")
+bg_rate_nn_monthly <- monthly_background_rate(declust_nn,"nn_is_background_like","Nearest-neighbour")
+bg_rate_reasenberg_monthly <- monthly_background_rate(declust_reasenberg,"reasenberg_is_background_like","Reasenberg-style")
+bg_rate_three_methods <- bind_rows(bg_rate_gk_monthly,bg_rate_nn_monthly,bg_rate_reasenberg_monthly)
+save_csv_mc(bg_rate_three_methods,"initial_background_rate_three_methods")
+
+p_bg_three <- ggplot(bg_rate_three_methods,aes(month,background_rate_per_day,linetype=method))+
+  geom_line(linewidth=.75)+labs(title="Comparison of Declustering-based Initial Background Rates",
+                                subtitle=paste0("Common input catalogue: M >= ",mc_main),x="Time",y="Background-like events per day",
+                                linetype="Declustering method")+theme_minimal()
+print(p_bg_three); save_plot_mc(p_bg_three,"initial_background_rate_three_methods",10,5)
+
+
+# DIAGNOSTIC 4: QUANTIFY INITIALIZATION DIFFERENCES
+bgwide <- bg_rate_three_methods %>% select(month,method,background_rate_per_day) %>%
+  pivot_wider(names_from=method,values_from=background_rate_per_day)
+init_metrics <- function(x,y,n1,n2) data.frame(method_1=n1,method_2=n2,
+                                               MAE=mean(abs(x-y),na.rm=TRUE),RMSE=sqrt(mean((x-y)^2,na.rm=TRUE)),
+                                               correlation=cor(x,y,use="complete.obs"))
+init_difference_summary <- bind_rows(
+  init_metrics(bgwide[["Gardner-Knopoff"]],bgwide[["Nearest-neighbour"]],"Gardner-Knopoff","Nearest-neighbour"),
+  init_metrics(bgwide[["Gardner-Knopoff"]],bgwide[["Reasenberg-style"]],"Gardner-Knopoff","Reasenberg-style"),
+  init_metrics(bgwide[["Nearest-neighbour"]],bgwide[["Reasenberg-style"]],"Nearest-neighbour","Reasenberg-style"))
+print(init_difference_summary)
+save_csv_mc(init_difference_summary,"diagnostic_initialisation_difference_metrics")
+
+bg2019 <- bg_rate_three_methods %>% filter(year(month)==2019) %>%
+  select(month,method,background_rate_per_day) %>% pivot_wider(names_from=method,values_from=background_rate_per_day)
+init_difference_2019 <- bind_rows(
+  init_metrics(bg2019[["Gardner-Knopoff"]],bg2019[["Nearest-neighbour"]],"Gardner-Knopoff","Nearest-neighbour"),
+  init_metrics(bg2019[["Gardner-Knopoff"]],bg2019[["Reasenberg-style"]],"Gardner-Knopoff","Reasenberg-style"),
+  init_metrics(bg2019[["Nearest-neighbour"]],bg2019[["Reasenberg-style"]],"Nearest-neighbour","Reasenberg-style")) %>%
+  mutate(period="2019")
+print(init_difference_2019)
+save_csv_mc(init_difference_2019,"diagnostic_initialisation_difference_metrics_2019")
 
 # ============================================================
-# STEP 2: Descriptive analysis for main catalogue
-# Main catalogue: Mc = 2.0
+# 11. OPTIONAL MINIMAL PARAMETER SENSITIVITY
+# Do NOT tune for a desired result; this is a robustness analysis.
 # ============================================================
+RUN_SENSITIVITY <- FALSE
+if (RUN_SENSITIVITY) {
+  gk_sens <- map_dfr(c(.5,1.0), function(fs){
+    z<-gardner_knopoff_declustering(catalog_main,fs)
+    data.frame(method="Gardner-Knopoff",parameter="fs_time_prop",value=fs,
+               background_fraction=mean(z$gk_is_background_like))})
+  
+  nn_sens <- map_dfr(c(1.4,1.6,1.8), function(dfv){
+    r<-compute_nearest_neighbor_eta(catalog_main,mc_main,b_catalogue,dfv)
+    mix<-fit_nn_mixture_threshold(r$nn_log_eta); z<-classify_nn_clusters(r,mix$threshold)
+    data.frame(method="Nearest-neighbour",parameter="d_f",value=dfv,threshold=mix$threshold,
+               background_fraction=mean(z$nn_is_background_like))})
+  
+  rg <- expand.grid(rfact=c(5,10,20),tau_max=c(5,10,15))
+  reas_sens <- pmap_dfr(rg,function(rfact,tau_max){
+    z<-reasenberg_style_declustering(catalog_main,1,tau_max,.95,.5,1.5,rfact)
+    data.frame(method="Reasenberg-style",rfact=rfact,tau_max=tau_max,
+               background_fraction=mean(z$reasenberg_is_background_like))})
+  
+  save_csv_mc(gk_sens,"sensitivity_gardner_knopoff")
+  save_csv_mc(nn_sens,"sensitivity_nearest_neighbor")
+  save_csv_mc(reas_sens,"sensitivity_reasenberg_style")
+}
 
-# Create main catalogue for descriptive analysis
-mc_main <- 2.0
-catalog_main <- catalog %>%
-  filter(mag >= mc_main) %>%
-  mutate(date_only = as.Date(datetime),year = year(datetime),
-         month = floor_date(datetime, "month"), year_month = format(datetime, "%Y-%m")) %>%
-  arrange(datetime)
-
-cat("Main catalogue Mc =", mc_main, "\n")
-cat("Number of events in main catalogue:", nrow(catalog_main), "\n")
-cat("Time range:", as.character(min(catalog_main$datetime)), "to",
-    as.character(max(catalog_main$datetime)), "\n")
-cat("Magnitude range:", min(catalog_main$mag), "to", max(catalog_main$mag), "\n")
-cat("Depth range:", min(catalog_main$depth), "to", max(catalog_main$depth), "\n")
-
-# Catalogue overview summary
-
-catalog_summary <- data.frame(
-  statistic = c("Mc threshold","Number of events","Start time","End time",
-                "Minimum magnitude", "Maximum magnitude","Mean magnitude",
-                "Median magnitude","Minimum depth","Maximum depth","Mean depth",
-                "Median depth","Minimum latitude","Maximum latitude","Minimum longitude",
-                "Maximum longitude"),
-  value = c(mc_main,nrow(catalog_main),as.character(min(catalog_main$datetime, na.rm = TRUE)),
-            as.character(max(catalog_main$datetime, na.rm = TRUE)),
-            round(min(catalog_main$mag, na.rm = TRUE), 2),
-            round(max(catalog_main$mag, na.rm = TRUE), 2),
-            round(mean(catalog_main$mag, na.rm = TRUE), 2),
-            round(median(catalog_main$mag, na.rm = TRUE), 2),
-            round(min(catalog_main$depth, na.rm = TRUE), 2),
-            round(max(catalog_main$depth, na.rm = TRUE), 2),
-            round(mean(catalog_main$depth, na.rm = TRUE), 2),
-            round(median(catalog_main$depth, na.rm = TRUE), 2),
-            round(min(catalog_main$lat, na.rm = TRUE), 3),
-            round(max(catalog_main$lat, na.rm = TRUE), 3),
-            round(min(catalog_main$lon, na.rm = TRUE), 3),
-            round(max(catalog_main$lon, na.rm = TRUE), 3)))
-print(catalog_summary)
-
-write.csv(catalog_summary,"descriptive_catalog_summary_Mc_2.csv",row.names = FALSE)
-
-# Annual event counts
-annual_counts <- catalog_main %>%
-  group_by(year) %>%
-  summarise(
-    n_events = n(),
-    max_mag = max(mag, na.rm = TRUE),
-    mean_mag = mean(mag, na.rm = TRUE),
-    median_mag = median(mag, na.rm = TRUE),
-    .groups = "drop"
-  )
-
-print(annual_counts)
-
-write.csv(
-  annual_counts,
-  "annual_event_counts_Mc_2.csv",
-  row.names = FALSE
-)
-
-p_annual <- ggplot(annual_counts, aes(x = year, y = n_events)) +
-  geom_col() +
-  labs(
-    title = "Annual Number of Earthquakes",
-    subtitle = "Main catalogue: M >= 2.0",
-    x = "Year",
-    y = "Number of events"
-  ) +
-  theme_minimal()
-
-print(p_annual)
-
-ggsave(
-  "annual_event_counts_Mc_2.png",
-  p_annual,
-  width = 8,
-  height = 5,
-  dpi = 300
-)
-
-# Monthly event counts
-monthly_counts <- catalog_main %>%
-  group_by(month) %>%
-  summarise(
-    n_events = n(),
-    max_mag = max(mag, na.rm = TRUE),
-    mean_mag = mean(mag, na.rm = TRUE),
-    .groups = "drop"
-  )
-
-print(head(monthly_counts))
-
-write.csv(
-  monthly_counts,
-  "monthly_event_counts_Mc_2.csv",
-  row.names = FALSE
-)
-
-p_monthly <- ggplot(monthly_counts, aes(x = month, y = n_events)) +
-  geom_line(linewidth = 0.6) +
-  geom_point(size = 1) +
-  labs(
-    title = "Monthly Number of Earthquakes",
-    subtitle = "Main catalogue: M >= 2",
-    x = "Time",
-    y = "Number of events"
-  ) +
-  theme_minimal()
-
-print(p_monthly)
-
-ggsave(
-  "monthly_event_counts_Mc_2.png",
-  p_monthly,
-  width = 9,
-  height = 5,
-  dpi = 300
-)
-
-# Cumulative event count through time
-catalog_cum <- catalog_main %>%
-  arrange(datetime) %>%
-  mutate(cumulative_events = row_number())
-
-p_cumulative <- ggplot(catalog_cum, aes(x = datetime, y = cumulative_events)) +
-  geom_line(linewidth = 0.7) +
-  labs(
-    title = "Cumulative Number of Earthquakes over Time",
-    subtitle = "Steeper segments indicate periods of increased seismic activity",
-    x = "Time",
-    y = "Cumulative number of events"
-  ) +
-  theme_minimal()
-
-print(p_cumulative)
-
-ggsave(
-  "cumulative_event_count_Mc_2.png",
-  p_cumulative,
-  width = 9,
-  height = 5,
-  dpi = 300
-)
+#  FINAL SANITY CHECKS
+stopifnot(nrow(catalog_main)==nrow(declust_gk),
+          nrow(catalog_main)==nrow(declust_nn),
+          nrow(catalog_main)==nrow(declust_reasenberg))
+cat("\nAll three methods used the same Mc=",mc_main," catalogue; N=",nrow(catalog_main),"\n",sep="")
+cat("\nOverall background fractions:\n"); print(overall_background_summary)
+cat("\nPairwise agreement:\n"); print(pairwise_agreement)
+cat("\n2019 diagnostic:\n"); print(period_summary)
+cat("\nInitialization differences:\n"); print(init_difference_summary)
 
 # ============================================================
-# MODEL COMPARISON 1
-# Homogeneous Poisson baseline
-# Main catalogue: Mc = 2.0
+# STEP 4: NON-STATIONARY TEMPORAL ETAS
+# Declustering-based initialisation experiment
+#
+# Core experiment:
+# same M >= 2.0 catalogue
+# -> same ETAS model
+# -> different declustering-based starting mu(t)
+# -> compare final fitted parameters and final mu(t)
 # ============================================================
-catalog_model <- catalog_main %>%
-  filter(!is.na(datetime), !is.na(mag)) %>%
-  arrange(datetime)
-
-# ------------------------------------------------------------
-# Convert event times to days from catalogue start
-# ------------------------------------------------------------
-
+# model test
+# MODEL COMPARISON 1 (Homogeneous Poisson baseline vs ETAS)
+catalog_model <- catalog_main 
 t0 <- min(catalog_model$datetime)
 t_end <- max(catalog_model$datetime)
-
 catalog_model <- catalog_model %>%
-  mutate(
-    time_days = as.numeric(
-      difftime(datetime, t0, units = "days")
-    )
-  )
-
+  mutate(time_days = as.numeric(difftime(datetime, t0, units = "days")))
 N <- nrow(catalog_model)
-
-T_days <- as.numeric(
-  difftime(t_end, t0, units = "days")
-)
-
-# ------------------------------------------------------------
-# Homogeneous Poisson MLE
-# ------------------------------------------------------------
+T_days <- as.numeric(difftime(t_end, t0, units = "days"))
 
 lambda_hat <- N / T_days
+logLik_poisson <- N * log(lambda_hat) - lambda_hat * T_days
 
-logLik_poisson <-
-  N * log(lambda_hat) -
-  lambda_hat * T_days
-
-# Number of free parameters
 k_poisson <- 1
+AIC_poisson <- -2 * logLik_poisson + 2 * k_poisson
 
-AIC_poisson <-
-  -2 * logLik_poisson +
-  2 * k_poisson
+BIC_poisson <- -2 * logLik_poisson + log(N) * k_poisson
 
-BIC_poisson <-
-  -2 * logLik_poisson +
-  log(N) * k_poisson
-
-poisson_results <- data.frame(
-  model = "Homogeneous Poisson",
-  n_events = N,
-  duration_days = T_days,
-  lambda_per_day = lambda_hat,
-  logLik = logLik_poisson,
-  k = k_poisson,
-  AIC = AIC_poisson,
-  BIC = BIC_poisson
-)
-
+poisson_results <- data.frame(model = "Homogeneous Poisson",n_events = N,
+                              duration_days = T_days,lambda_per_day = lambda_hat,
+                              logLik = logLik_poisson,k = k_poisson,AIC = AIC_poisson,
+                              BIC = BIC_poisson)
 print(poisson_results)
-
-write.csv(
-  poisson_results,
-  "model_comparison_poisson_Mc_2.csv",
-  row.names = FALSE
-)
-
-# ============================================================
+write.csv(poisson_results,"model_comparison_poisson.csv",row.names = FALSE)
 # MODEL COMPARISON 2
-# Stationary temporal ETAS using SAPP
-# ============================================================
-# ------------------------------------------------------------
-# Prepare event times
-# SAPP needs event times in a numeric time scale
-# ------------------------------------------------------------
-
+# Stationary temporal ETAS 
 etas_time <- catalog_model$time_days
 etas_mag  <- catalog_model$mag
 
@@ -1446,865 +1974,116 @@ fit_stationary$convergence
 fit_nonstationary$convergence
 
 
-# ============================================================
-# Spatial distribution map
-# Point size = magnitude
-# Point color = 2019 vs non-2019
-# Main catalogue: Mc = 2.0
-# ============================================================
-
-# Add period group
-catalog_main_spatial <- catalog_main %>%
-  mutate(
-    period_group = ifelse(
-      year(datetime) == 2019,
-      "2019",
-      "non-2019"
-    )
-  )
-
-# California map
-usa_map <- map_data("state")
-
-california_map <- usa_map %>%
-  filter(region == "california")
-
-# Plot
-p_spatial_map <- ggplot() +
-  
-  geom_polygon(
-    data = california_map,
-    aes(
-      x = long,
-      y = lat,
-      group = group
-    ),
-    fill = "gray95",
-    color = "gray60"
-  ) +
-  
-  geom_point(
-    data = catalog_main_spatial,
-    aes(
-      x = lon,
-      y = lat,
-      size = mag,
-      color = period_group
-    ),
-    alpha = 0.45
-  ) +
-  
-  coord_fixed(
-    xlim = c(
-      min(catalog_main_spatial$lon, na.rm = TRUE) - 0.2,
-      max(catalog_main_spatial$lon, na.rm = TRUE) + 0.2
-    ),
-    ylim = c(
-      min(catalog_main_spatial$lat, na.rm = TRUE) - 0.2,
-      max(catalog_main_spatial$lat, na.rm = TRUE) + 0.2
-    )
-  ) +
-  
-  scale_size_continuous(
-    range = c(0.5, 4)
-  ) +
-  
-  labs(
-    title = "Spatial Distribution of Earthquakes",
-    subtitle = "Point size represents magnitude; color distinguishes 2019 from other years; M >= 2.0",
-    x = "Longitude",
-    y = "Latitude",
-    size = "Magnitude",
-    color = "Period"
-  ) +
-  
-  theme_minimal()
-
-print(p_spatial_map)
-
-ggsave(
-  "spatial_distribution_2019_vs_non2019_Mc_2.png",
-  p_spatial_map,
-  width = 8,
-  height = 6,
-  dpi = 300
-)
-catalog_non2019 <- catalog_main_spatial %>%
-  filter(period_group == "non-2019")
-
-catalog_2019 <- catalog_main_spatial %>%
-  filter(period_group == "2019")
-
-p_spatial_map <- ggplot() +
-  
-  geom_polygon(
-    data = california_map,
-    aes(
-      x = long,
-      y = lat,
-      group = group
-    ),
-    fill = "gray95",
-    color = "gray60"
-  ) +
-  
-  # Plot non-2019 first
-  geom_point(
-    data = catalog_non2019,
-    aes(
-      x = lon,
-      y = lat,
-      size = mag,
-      color = period_group
-    ),
-    alpha = 0.25
-  ) +
-  
-  # Plot 2019 on top
-  geom_point(
-    data = catalog_2019,
-    aes(
-      x = lon,
-      y = lat,
-      size = mag,
-      color = period_group
-    ),
-    alpha = 0.65
-  ) +
-  
-  coord_fixed(
-    xlim = c(
-      min(catalog_main_spatial$lon, na.rm = TRUE) - 0.2,
-      max(catalog_main_spatial$lon, na.rm = TRUE) + 0.2
-    ),
-    ylim = c(
-      min(catalog_main_spatial$lat, na.rm = TRUE) - 0.2,
-      max(catalog_main_spatial$lat, na.rm = TRUE) + 0.2
-    )
-  ) +
-  
-  scale_size_continuous(
-    range = c(0.5, 4)
-  ) +
-  
-  labs(
-    title = "Spatial Distribution of Earthquakes",
-    subtitle = "Magnitude shown by point size; 2019 events highlighted; M >= 2.0",
-    x = "Longitude",
-    y = "Latitude",
-    size = "Magnitude",
-    color = "Period"
-  ) +
-  
-  theme_minimal()
-
-# Display plot
-print(p_spatial_map)
-
-
-# Save plot
-ggsave(
-  "spatial_distribution_2019_vs_non2019_Mc_2.png",
-  p_spatial_map,
-  width = 8,
-  height = 6,
-  dpi = 300
-)
-
-
-#  Event burst around the largest earthquake
-
-largest_event <- catalog_main %>%
-  arrange(desc(mag)) %>%
-  slice(1)
-
-print(largest_event)
-
-mainshock_time <- largest_event$datetime[1]
-window_days <- 30
-
-catalog_around_mainshock <- catalog_main %>%
-  filter(
-    datetime >= mainshock_time - days(window_days),
-    datetime <= mainshock_time + days(window_days)
-  ) %>%
-  mutate(
-    days_from_mainshock = as.numeric(
-      difftime(datetime, mainshock_time, units = "days")
-    )
-  )
-
-p_around_mag <- ggplot(catalog_around_mainshock, aes(x = days_from_mainshock, y = mag)) +
-  geom_point(alpha = 0.6) +
-  geom_vline(xintercept = 0, linetype = "dashed") +
-  labs(
-    title = "Seismicity around the Largest Event",
-    subtitle = paste0(
-      "Largest event: M = ",
-      largest_event$mag,
-      "; window = ±",
-      window_days,
-      " days"
-    ),
-    x = "Days from largest event",
-    y = "Magnitude"
-  ) +
-  theme_minimal()
-
-print(p_around_mag)
-
-ggsave(
-  "seismicity_around_largest_event_Mc_2.png",
-  p_around_mag,
-  width = 8,
-  height = 5,
-  dpi = 300
-)
-
-daily_around_mainshock <- catalog_around_mainshock %>%
-  mutate(relative_day = floor(days_from_mainshock)) %>%
-  group_by(relative_day) %>%
-  summarise(
-    n_events = n(),
-    max_mag = max(mag, na.rm = TRUE),
-    .groups = "drop"
-  )
-
-p_around_daily <- ggplot(daily_around_mainshock, aes(x = relative_day, y = n_events)) +
-  geom_col() +
-  geom_vline(xintercept = 0, linetype = "dashed") +
-  labs(
-    title = "Daily Event Counts around the Largest Event",
-    subtitle = paste0(
-      "Largest event: M = ",
-      largest_event$mag
-    ),
-    x = "Days from largest event",
-    y = "Number of events"
-  ) +
-  theme_minimal()
-
-print(p_around_daily)
-
-ggsave(
-  "daily_counts_around_largest_event_Mc_2.png",
-  p_around_daily,
-  width = 8,
-  height = 5,
-  dpi = 300
-)
-
-#  Write short text summary
-
-summary_text <- paste0(
-  "Descriptive analysis summary\n",
-  "============================\n",
-  "Main catalogue threshold: M >= ", mc_main, "\n",
-  "Number of events: ", nrow(catalog_main), "\n",
-  "Time range: ", min(catalog_main$datetime), " to ", max(catalog_main$datetime), "\n",
-  "Magnitude range: ", min(catalog_main$mag), " to ", max(catalog_main$mag), "\n",
-  "Depth range: ", min(catalog_main$depth), " to ", max(catalog_main$depth), " km\n",
-  "Estimated b-value at Mc = ", mc_main, ": ", round(b_main, 3), "\n",
-  "Largest event magnitude: ", largest_event$mag, "\n",
-  "Number of events with M >= ", large_mag_threshold, ": ", nrow(large_events), "\n"
-)
-
-cat(summary_text)
-
-writeLines(
-  summary_text,
-  "descriptive_analysis_text_summary_Mc_2.txt"
-)
-# ============================================================
-# STEP 3: Declustering and ETAS initialization
-# Main catalogue: Mc = 2.0
-# ============================================================
-# Methods
-# A. Gardner-Knopoff window declustering
-# B. Zaliapin-Ben-Zion-style nearest-neighbour cluster declustering
-# C. Reasenberg-style interaction-link declustering
-#
-# Experimental principle:
-# SAME input catalogue -> different declustering schemes -> harmonised
-# background-like indicator -> comparable ETAS initialisation.
-# ============================================================
-
-`%||%` <- function(x, y) if (is.null(x) || length(x)==0 || all(is.na(x))) y else x
-
-# ============================================================
-# 0. LOCK THE COMMON INPUT CATALOGUE
-# ============================================================
 mc_main <- 2.0
-bin_width <- 0.1
-mc_tag <- gsub("\\.", "_", sprintf("%.1f", mc_main))
 
-catalog_main <- catalog %>%
-  filter(!is.na(datetime), !is.na(mag), !is.na(lat), !is.na(lon), mag >= mc_main) %>%
-  arrange(datetime) %>%
-  mutate(event_index = row_number(), original_order = row_number(), year = year(datetime))
+# Main non-stationary background specification
+mu_df_main <- 8
+penalty_lambda_main <- 1
 
-stopifnot(all(catalog_main$mag >= mc_main))
-cat("Main declustering catalogue: Mc =", mc_main, "; N =", nrow(catalog_main), "\n")
+# Triggering contribution truncated after 10 years.
+# This is a modelling/computational approximation and should
+# later be checked in sensitivity analysis.
+max_trigger_days_main <- 3650
 
-# ============================================================
-# 1. SHARED HELPERS
-# ============================================================
-haversine_km <- function(lon1, lat1, lon2, lat2) {
-  R <- 6371.227
-  lon1 <- lon1*pi/180; lat1 <- lat1*pi/180
-  lon2 <- lon2*pi/180; lat2 <- lat2*pi/180
-  dlon <- lon2-lon1; dlat <- lat2-lat1
-  a <- sin(dlat/2)^2 + cos(lat1)*cos(lat2)*sin(dlon/2)^2
-  R * 2 * atan2(sqrt(a), sqrt(1-a))
-}
+maxit_main <- 300
 
-decimal_year <- function(datetime) {
-  tz <- attr(datetime, "tzone") %||% "UTC"
-  y <- year(datetime)
-  y0 <- as.POSIXct(paste0(y,"-01-01 00:00:00"), tz=tz)
-  y1 <- as.POSIXct(paste0(y+1,"-01-01 00:00:00"), tz=tz)
-  y + as.numeric(difftime(datetime,y0,units="secs")) /
-    as.numeric(difftime(y1,y0,units="secs"))
-}
+# Optional computationally expensive robustness analyses
+RUN_EXTRA_STARTS <- FALSE
+RUN_MODEL_ROBUSTNESS <- FALSE
 
-estimate_b_value_local <- function(mags, mc, bin_width=0.1) {
-  x <- mags[is.finite(mags) & mags >= mc]
-  n <- length(x)
-  if (n < 30) return(data.frame(mc=mc,n=n,b=NA,delta_b=NA))
-  mean_mag <- mean(x)
-  b <- log10(exp(1))/(mean_mag-(mc-bin_width/2))
-  delta_b <- 2.3*b^2*sqrt(sum((x-mean_mag)^2)/(n*(n-1)))
-  data.frame(mc=mc,n=n,b=b,delta_b=delta_b)
-}
-
-b_info_declustering <- estimate_b_value_local(catalog_main$mag, mc_main, bin_width)
-b_catalogue <- b_info_declustering$b
-cat("b-value estimated at Mc=2.0:", b_catalogue, "\n")
-
-save_csv_mc <- function(x, stem) {
-  f <- paste0(stem,"_Mc_",mc_tag,".csv")
-  write.csv(x,f,row.names=FALSE); invisible(f)
-}
-save_plot_mc <- function(p, stem, width=9, height=5, dpi=300) {
-  f <- paste0(stem,"_Mc_",mc_tag,".png")
-  ggsave(f,p,width=width,height=height,dpi=dpi); invisible(f)
-}
 
 # ============================================================
-# 2. A. GARDNER-KNOPOFF
-# Literature/reference implementation style: OpenQuake/HMTK Type 1
-# Baseline fs_time_prop = 1.0; 0.5 retained for sensitivity.
+# 1. PREPARE COMMON FULL Mc-COMPLETE ETAS CATALOGUE
 # ============================================================
-gk_space_window_km <- function(M) 10^(0.1238*M + 0.983)
-gk_time_window_days <- function(M) ifelse(M < 6.5,
-                                          10^(0.5409*M - 0.547), 10^(0.032*M + 2.7389))
-
-gardner_knopoff_declustering <- function(df, fs_time_prop=1.0, time_cutoff_days=NULL) {
-  stopifnot(fs_time_prop>=0, fs_time_prop<=1)
-  d0 <- df %>% arrange(datetime) %>%
-    mutate(original_order=row_number(),
-           gk_space_window_km=gk_space_window_km(mag),
-           gk_time_window_days=gk_time_window_days(mag))
-  if (!is.null(time_cutoff_days))
-    d0$gk_time_window_days <- pmin(d0$gk_time_window_days,time_cutoff_days)
-  
-  d <- d0 %>% arrange(desc(mag),datetime)
-  n <- nrow(d)
-  d$gk_cluster_id <- 0L; d$gk_flag <- 0L
-  d$gk_parent_evid <- NA; d$gk_parent_mag <- NA_real_
-  cid <- 0L
-  
-  if (n>=2) for (i in seq_len(n-1)) {
-    if (i%%1000==0) cat("GK",i,"/",n,"\n")
-    if (d$gk_cluster_id[i]!=0L) next
-    dt <- as.numeric(difftime(d$datetime,d$datetime[i],units="days"))
-    keep_t <- d$gk_cluster_id==0L &
-      dt >= -d$gk_time_window_days[i]*fs_time_prop &
-      dt <= d$gk_time_window_days[i]
-    idx <- which(keep_t); if (length(idx)<=1) next
-    dist <- haversine_km(d$lon[idx],d$lat[idx],d$lon[i],d$lat[i])
-    inside <- idx[dist <= d$gk_space_window_km[i]]
-    if (length(setdiff(inside,i))==0) next
-    cid <- cid+1L
-    d$gk_cluster_id[inside] <- cid
-    d$gk_flag[inside] <- 1L
-    d$gk_flag[inside[dt[inside]<0]] <- -1L
-    d$gk_flag[i] <- 0L
-    nonmain <- setdiff(inside,i)
-    d$gk_parent_evid[nonmain] <- d$evid[i]
-    d$gk_parent_mag[nonmain] <- d$mag[i]
-  }
-  
-  d %>% arrange(original_order) %>% mutate(
-    gk_label=case_when(
-      gk_cluster_id==0L ~ "background",
-      gk_cluster_id!=0L & gk_flag==0L ~ "mainshock",
-      gk_flag==1L ~ "aftershock",
-      gk_flag==-1L ~ "foreshock",
-      TRUE ~ "unknown"),
-    gk_is_background_like=gk_label %in% c("background","mainshock"),
-    gk_background_prob=as.numeric(gk_is_background_like))
-}
-
-gk_fs_baseline <- 1.0
-declust_gk <- gardner_knopoff_declustering(catalog_main,gk_fs_baseline)
-gk_summary <- declust_gk %>% count(gk_label,name="n") %>%
-  mutate(percentage=100*n/sum(n),method="Gardner-Knopoff")
-print(gk_summary)
-save_csv_mc(declust_gk,"declustering_gardner_knopoff")
-save_csv_mc(gk_summary,"declustering_gardner_knopoff_summary")
-
-etas_init_gk <- declust_gk %>% select(
-  evid,datetime,lat,lon,depth,mag,gk_cluster_id,gk_flag,gk_label,
-  gk_is_background_like,gk_background_prob,gk_parent_evid,gk_parent_mag,
-  gk_space_window_km,gk_time_window_days)
-save_csv_mc(etas_init_gk,"etas_initialization_gardner_knopoff")
-
-# ============================================================
-# 3. B. ZALIAPIN-BEN-ZION-STYLE NEAREST NEIGHBOUR
-# Literature-aligned deterministic cluster-analysis version:
-# - eta combines time, distance, parent magnitude
-# - d_f baseline = 1.6 for epicentral analysis
-# - b estimated from this Mc=2.0 catalogue
-# - 2-Gaussian mixture replaces the old k-means threshold
-# NOTE: This is NOT the exact stochastic random-thinning algorithm of ZB2020.
-# ============================================================
-compute_nearest_neighbor_eta <- function(df,mc,b_value,d_f=1.6,use_depth=FALSE,
-                                         max_lookback_years=Inf,max_previous_events=Inf) {
-  d <- df %>% arrange(datetime) %>% mutate(
-    event_index=row_number(),decimal_year=decimal_year(datetime),
-    nn_parent_index=NA_integer_,nn_parent_evid=NA,
-    nn_time_years=NA_real_,nn_distance_km=NA_real_,
-    nn_parent_mag=NA_real_,nn_log_eta=NA_real_)
-  n <- nrow(d)
-  if (n>=2) for (j in 2:n) {
-    if (j%%1000==0) cat("NN",j,"/",n,"\n")
-    prev <- seq_len(j-1)
-    dtall <- d$decimal_year[j]-d$decimal_year[prev]
-    keep <- dtall>0
-    if (is.finite(max_lookback_years)) keep <- keep & dtall<=max_lookback_years
-    prev <- prev[keep]; if (!length(prev)) next
-    if (is.finite(max_previous_events) && length(prev)>max_previous_events)
-      prev <- tail(prev,as.integer(max_previous_events))
-    dt <- d$decimal_year[j]-d$decimal_year[prev]
-    dt[dt<=0] <- 1/(365.25*24*3600)
-    epi <- haversine_km(d$lon[prev],d$lat[prev],d$lon[j],d$lat[j])
-    epi[epi<=0] <- 0.001
-    r <- if (use_depth) sqrt(epi^2+(d$depth[j]-d$depth[prev])^2) else epi
-    r[r<=0] <- 0.001
-    pm <- d$mag[prev]
-    logeta <- log10(dt)+d_f*log10(r)-b_value*(pm-mc)
-    q <- which.min(logeta); parent <- prev[q]
-    d$nn_parent_index[j] <- parent; d$nn_parent_evid[j] <- d$evid[parent]
-    d$nn_time_years[j] <- dt[q]; d$nn_distance_km[j] <- r[q]
-    d$nn_parent_mag[j] <- pm[q]; d$nn_log_eta[j] <- logeta[q]
-  }
-  d
-}
-
-fit_nn_mixture_threshold <- function(log_eta,seed=123) {
-  x <- log_eta[is.finite(log_eta)]
-  if (length(x)<100) stop("Too few finite eta values")
-  set.seed(seed)
-  fit <- mclust::Mclust(x,G=2,modelNames=c("E","V"),verbose=FALSE)
-  grid <- seq(quantile(x,.001),quantile(x,.999),length.out=4000)
-  pr <- predict(fit,newdata=grid)
-  thr <- if (!is.null(pr$z) && ncol(pr$z)==2)
-    grid[which.min(abs(pr$z[,1]-pr$z[,2]))] else mean(fit$parameters$mean)
-  list(fit=fit,threshold=thr,means=sort(as.numeric(fit$parameters$mean)))
-}
-
-classify_nn_clusters <- function(df,threshold) {
-  d <- df %>% arrange(datetime) %>% mutate(
-    nn_is_clustered_edge=ifelse(is.na(nn_log_eta),FALSE,nn_log_eta<threshold),
-    nn_cluster_id=0L,nn_mainshock_evid=NA,nn_label="background")
-  n <- nrow(d); adj <- vector("list",n); for(i in seq_len(n)) adj[[i]] <- integer(0)
-  for(j in seq_len(n)) {
-    p <- d$nn_parent_index[j]
-    if (!is.na(p) && d$nn_is_clustered_edge[j]) {
-      adj[[j]] <- unique(c(adj[[j]],p)); adj[[p]] <- unique(c(adj[[p]],j))
-    }
-  }
-  visited <- rep(FALSE,n); cid <- 0L
-  for(i in seq_len(n)) {
-    if (visited[i]) next
-    stack <- i; comp <- integer(0)
-    while(length(stack)) {
-      v <- stack[1]; stack <- stack[-1]
-      if (visited[v]) next
-      visited[v] <- TRUE; comp <- c(comp,v); stack <- unique(c(stack,adj[[v]]))
-    }
-    if (length(comp)==1) next
-    cid <- cid+1L
-    m <- comp[which.max(d$mag[comp])]; mt <- d$datetime[m]; me <- d$evid[m]
-    d$nn_cluster_id[comp] <- cid; d$nn_mainshock_evid[comp] <- me
-    for(k in comp) d$nn_label[k] <- if(k==m) "mainshock" else if(d$datetime[k]<mt) "foreshock" else "aftershock"
-  }
-  d %>% mutate(nn_is_background_like=nn_label %in% c("background","mainshock"),
-               nn_background_prob=as.numeric(nn_is_background_like))
-}
-
-nn_df_baseline <- 1.6
-nn_raw <- compute_nearest_neighbor_eta(catalog_main,mc_main,b_catalogue,nn_df_baseline,
-                                       use_depth=FALSE,max_lookback_years=Inf,max_previous_events=Inf)
-nn_mix <- fit_nn_mixture_threshold(nn_raw$nn_log_eta)
-nn_eta_threshold <- nn_mix$threshold
-cat("NN: d_f=",nn_df_baseline," b=",b_catalogue," threshold=",nn_eta_threshold,"\n")
-declust_nn <- classify_nn_clusters(nn_raw,nn_eta_threshold)
-nn_summary <- declust_nn %>% count(nn_label,name="n") %>%
-  mutate(percentage=100*n/sum(n),method="Nearest-neighbour")
-print(nn_summary)
-save_csv_mc(declust_nn,"declustering_nearest_neighbor")
-save_csv_mc(nn_summary,"declustering_nearest_neighbor_summary")
-
-etas_init_nn <- declust_nn %>% select(
-  evid,datetime,lat,lon,depth,mag,nn_parent_evid,nn_parent_index,
-  nn_time_years,nn_distance_km,nn_parent_mag,nn_log_eta,nn_cluster_id,
-  nn_mainshock_evid,nn_label,nn_is_background_like,nn_background_prob)
-save_csv_mc(etas_init_nn,"etas_initialization_nearest_neighbor")
-
-p_nn_eta <- ggplot(declust_nn %>% filter(is.finite(nn_log_eta)),aes(nn_log_eta))+
-  geom_histogram(bins=80)+geom_vline(xintercept=nn_eta_threshold,linetype="dashed")+
-  labs(title="Nearest-neighbour proximity distribution",
-       subtitle="Two-component Gaussian-mixture threshold",
-       x=expression(log[10](eta)),y="Number of events")+theme_minimal()
-print(p_nn_eta); save_plot_mc(p_nn_eta,"nearest_neighbor_log_eta_distribution",8,5)
-
-# ============================================================
-# 4. C. REASENBERG-STYLE INTERACTION-LINK DECLUSTERING
-# Standard literature baseline values:
-# tau_min=1 day, tau_max=10 days, p1=.95, xk=.5, xmeff=4, rfact=10
-# IMPORTANT: still label as "Reasenberg-style" unless the final thesis uses
-# original CLUSTER2000/ZMAP output.
-# ============================================================
-reasenberg_crack_radius_km <- function(M) 10^(0.4*M-1.2)
-reasenberg_interaction_radius_km <- function(M,rfact=10) rfact*reasenberg_crack_radius_km(M)
-
-# Literature-inspired dynamic look-ahead, bounded by tau_min/tau_max.
-# This makes p1 active; it is not a byte-for-byte CLUSTER2000 port.
-reasenberg_tau <- function(cluster_max_mag,elapsed_days,tau_min=1,tau_max=10,
-                           p1=.95,xmeff=4,xk=.5) {
-  effective_cutoff <- xmeff + xk*pmax(cluster_max_mag-xmeff,0)
-  delta_m <- pmax(cluster_max_mag-effective_cutoff,0)
-  base <- pmax(elapsed_days,tau_min)
-  tau <- -log(1-p1)*base/10^(2*(delta_m-1)/3)
-  pmin(tau_max,pmax(tau_min,tau))
-}
-
-reasenberg_style_declustering <- function(df,tau_min=1,tau_max=10,p1=.95,
-                                          xk=.5,xmeff=4,rfact=10) {
-  d <- df %>% arrange(datetime) %>% mutate(
-    reasenberg_cluster_id=0L,reasenberg_parent_index=NA_integer_,
-    reasenberg_parent_evid=NA,reasenberg_distance_km=NA_real_,
-    reasenberg_time_days=NA_real_)
-  n <- nrow(d); uf <- seq_len(n)
-  root <- function(x) { while(uf[x]!=x){uf[x]<<-uf[uf[x]];x<-uf[x]};x }
-  unite <- function(a,b){ra<-root(a);rb<-root(b);if(ra!=rb)uf[rb]<<-ra}
-  
-  if(n>=2) for(j in 2:n) {
-    if(j%%1000==0) cat("Reasenberg-style",j,"/",n,"\n")
-    dtall <- as.numeric(difftime(d$datetime[j],d$datetime[seq_len(j-1)],units="days"))
-    cand <- which(dtall>0 & dtall<=tau_max); if(!length(cand)) next
-    linked <- integer(0); ldist <- numeric(0)
-    for(i in cand) {
-      ri <- root(i); members <- which(sapply(seq_len(j-1),root)==ri)
-      Mmax <- max(d$mag[members]); tstart <- min(d$datetime[members])
-      elapsed <- as.numeric(difftime(d$datetime[i],tstart,units="days"))
-      tau_i <- reasenberg_tau(Mmax,elapsed,tau_min,tau_max,p1,xmeff,xk)
-      dtij <- as.numeric(difftime(d$datetime[j],d$datetime[i],units="days"))
-      if(dtij>tau_i) next
-      dij <- haversine_km(d$lon[i],d$lat[i],d$lon[j],d$lat[j])
-      if(dij<=reasenberg_interaction_radius_km(d$mag[i],rfact)) {
-        linked <- c(linked,i); ldist <- c(ldist,dij)
-      }
-    }
-    if(!length(linked)) next
-    for(i in linked) unite(i,j)
-    q <- which.min(ldist); p <- linked[q]
-    d$reasenberg_parent_index[j] <- p; d$reasenberg_parent_evid[j] <- d$evid[p]
-    d$reasenberg_distance_km[j] <- ldist[q]
-    d$reasenberg_time_days[j] <- as.numeric(difftime(d$datetime[j],d$datetime[p],units="days"))
-  }
-  
-  roots <- sapply(seq_len(n),root); tab <- table(roots)
-  clustered_roots <- as.integer(names(tab[tab>1])); cmap <- setNames(seq_along(clustered_roots),clustered_roots)
-  d$reasenberg_cluster_id <- ifelse(roots %in% clustered_roots,
-                                    unname(cmap[as.character(roots)]),0L)
-  d$reasenberg_label <- "background"; d$reasenberg_mainshock_evid <- NA
-  for(cid in sort(unique(d$reasenberg_cluster_id[d$reasenberg_cluster_id>0]))) {
-    idx <- which(d$reasenberg_cluster_id==cid); m <- idx[which.max(d$mag[idx])]
-    mt <- d$datetime[m]; me <- d$evid[m]; d$reasenberg_mainshock_evid[idx] <- me
-    d$reasenberg_label[idx] <- ifelse(idx==m,"mainshock",
-                                      ifelse(d$datetime[idx]<mt,"foreshock","aftershock"))
-  }
-  d %>% mutate(reasenberg_is_background_like=reasenberg_label %in% c("background","mainshock"),
-               reasenberg_background_prob=as.numeric(reasenberg_is_background_like))
-}
-
-reas_baseline <- list(tau_min=1,tau_max=10,p1=.95,xk=.5,xmeff=4,rfact=10)
-declust_reasenberg <- reasenberg_style_declustering(
-  catalog_main,reas_baseline$tau_min,reas_baseline$tau_max,reas_baseline$p1,
-  reas_baseline$xk,reas_baseline$xmeff,reas_baseline$rfact)
-reasenberg_summary <- declust_reasenberg %>% count(reasenberg_label,name="n") %>%
-  mutate(percentage=100*n/sum(n),method="Reasenberg-style")
-print(reasenberg_summary)
-save_csv_mc(declust_reasenberg,"declustering_reasenberg_style")
-save_csv_mc(reasenberg_summary,"declustering_reasenberg_style_summary")
-
-etas_init_reasenberg <- declust_reasenberg %>% select(
-  evid,datetime,lat,lon,depth,mag,reasenberg_cluster_id,reasenberg_parent_index,
-  reasenberg_parent_evid,reasenberg_distance_km,reasenberg_time_days,
-  reasenberg_mainshock_evid,reasenberg_label,reasenberg_is_background_like,
-  reasenberg_background_prob)
-save_csv_mc(etas_init_reasenberg,"etas_initialization_reasenberg_style")
-
-# ============================================================
-# 5. HARMONISE EVENT-LEVEL OUTPUTS
-# ============================================================
-event_level_compare <- catalog_main %>% select(evid,datetime,mag,lat,lon,year) %>%
-  left_join(declust_gk %>% select(evid,gk_label,gk_is_background_like),by="evid") %>%
-  left_join(declust_nn %>% select(evid,nn_label,nn_is_background_like),by="evid") %>%
-  left_join(declust_reasenberg %>% select(evid,reasenberg_label,reasenberg_is_background_like),by="evid")
-stopifnot(nrow(event_level_compare)==nrow(catalog_main))
-stopifnot(!anyNA(event_level_compare[c("gk_is_background_like","nn_is_background_like","reasenberg_is_background_like")]))
-save_csv_mc(event_level_compare,"declustering_event_level_comparison")
-
-# ============================================================
-# 6. DIAGNOSTIC 1: OVERALL BACKGROUND FRACTION
-# ============================================================
-overall_background_summary <- bind_rows(
-  data.frame(method="Gardner-Knopoff",n_total=nrow(event_level_compare),
-             n_background_like=sum(event_level_compare$gk_is_background_like)),
-  data.frame(method="Nearest-neighbour",n_total=nrow(event_level_compare),
-             n_background_like=sum(event_level_compare$nn_is_background_like)),
-  data.frame(method="Reasenberg-style",n_total=nrow(event_level_compare),
-             n_background_like=sum(event_level_compare$reasenberg_is_background_like))) %>%
-  mutate(n_clustered=n_total-n_background_like,
-         background_fraction=n_background_like/n_total,
-         background_percentage=100*background_fraction)
-print(overall_background_summary)
-save_csv_mc(overall_background_summary,"diagnostic_overall_background_fraction")
-
-# ============================================================
-# 7. DIAGNOSTIC 2: EVENT-LEVEL AGREEMENT
-# ============================================================
-binary_jaccard <- function(x,y) { u<-sum(x|y); if(u==0) NA_real_ else sum(x&y)/u }
-cohen_kappa_binary <- function(x,y) {
-  x<-as.integer(x); y<-as.integer(y); po<-mean(x==y)
-  pe<-mean(x==1)*mean(y==1)+mean(x==0)*mean(y==0)
-  if(abs(1-pe)<1e-12) NA_real_ else (po-pe)/(1-pe)
-}
-agreement_pair <- function(x,y,m1,m2) data.frame(
-  method_1=m1,method_2=m2,raw_agreement=mean(x==y),
-  jaccard_background=binary_jaccard(x,y),kappa=cohen_kappa_binary(x,y),
-  n_disagree=sum(x!=y),disagreement_percentage=100*mean(x!=y))
-
-pairwise_agreement <- bind_rows(
-  agreement_pair(event_level_compare$gk_is_background_like,event_level_compare$nn_is_background_like,
-                 "Gardner-Knopoff","Nearest-neighbour"),
-  agreement_pair(event_level_compare$gk_is_background_like,event_level_compare$reasenberg_is_background_like,
-                 "Gardner-Knopoff","Reasenberg-style"),
-  agreement_pair(event_level_compare$nn_is_background_like,event_level_compare$reasenberg_is_background_like,
-                 "Nearest-neighbour","Reasenberg-style"))
-print(pairwise_agreement)
-save_csv_mc(pairwise_agreement,"diagnostic_pairwise_event_agreement")
-
-event_level_disagreement <- event_level_compare %>% mutate(
-  n_background_votes=as.integer(gk_is_background_like)+as.integer(nn_is_background_like)+as.integer(reasenberg_is_background_like),
-  unanimous=n_background_votes %in% c(0,3),any_disagreement=!unanimous)
-disagreement_summary <- event_level_disagreement %>% summarise(
-  n_total=n(),n_unanimous=sum(unanimous),n_disagreement=sum(any_disagreement),
-  disagreement_percentage=100*mean(any_disagreement))
-print(disagreement_summary)
-save_csv_mc(event_level_disagreement,"diagnostic_event_level_disagreement")
-save_csv_mc(disagreement_summary,"diagnostic_event_level_disagreement_summary")
-
-# ============================================================
-# 8. DIAGNOSTIC 3: 2019 VS NON-2019
-# ============================================================
-period_summary <- event_level_compare %>% mutate(period_group=ifelse(year==2019,"2019","non-2019")) %>%
-  group_by(period_group) %>% summarise(
-    n_total=n(),
-    gk_background=sum(gk_is_background_like),gk_background_fraction=mean(gk_is_background_like),
-    nn_background=sum(nn_is_background_like),nn_background_fraction=mean(nn_is_background_like),
-    reasenberg_background=sum(reasenberg_is_background_like),reasenberg_background_fraction=mean(reasenberg_is_background_like),
-    all_three_background=sum(gk_is_background_like&nn_is_background_like&reasenberg_is_background_like),
-    all_three_clustered=sum(!gk_is_background_like&!nn_is_background_like&!reasenberg_is_background_like),
-    any_method_disagreement=sum((as.integer(gk_is_background_like)+as.integer(nn_is_background_like)+as.integer(reasenberg_is_background_like)) %in% c(1,2)),
-    disagreement_fraction=any_method_disagreement/n_total,.groups="drop")
-print(period_summary)
-save_csv_mc(period_summary,"diagnostic_2019_vs_non2019_declustering")
-
-agreement_by_period <- event_level_compare %>% mutate(period_group=ifelse(year==2019,"2019","non-2019")) %>%
-  group_split(period_group) %>% map_dfr(function(z) bind_rows(
-    agreement_pair(z$gk_is_background_like,z$nn_is_background_like,"Gardner-Knopoff","Nearest-neighbour"),
-    agreement_pair(z$gk_is_background_like,z$reasenberg_is_background_like,"Gardner-Knopoff","Reasenberg-style"),
-    agreement_pair(z$nn_is_background_like,z$reasenberg_is_background_like,"Nearest-neighbour","Reasenberg-style")) %>%
-      mutate(period_group=unique(z$period_group)))
-print(agreement_by_period)
-save_csv_mc(agreement_by_period,"diagnostic_pairwise_agreement_2019_vs_non2019")
-
-# ============================================================
-# 9. MONTHLY ETAS INITIAL BACKGROUND RATE (events/day)
-# ============================================================
-monthly_background_rate <- function(df,background_col,method_name) {
-  tmp <- df %>% mutate(month=floor_date(datetime,"month"),bg=as.numeric(.data[[background_col]])) %>%
-    group_by(month) %>% summarise(total_events=n(),background_events=sum(bg),.groups="drop")
-  full <- tibble(month=seq(floor_date(min(catalog_main$datetime),"month"),
-                           floor_date(max(catalog_main$datetime),"month"),by="month"))
-  full %>% left_join(tmp,by="month") %>% mutate(
-    total_events=replace_na(total_events,0),background_events=replace_na(background_events,0),
-    days_in_month=days_in_month(month),
-    background_rate_per_day=background_events/days_in_month,
-    background_count_per_month=background_events,method=method_name)
-}
-
-bg_rate_gk_monthly <- monthly_background_rate(declust_gk,"gk_is_background_like","Gardner-Knopoff")
-bg_rate_nn_monthly <- monthly_background_rate(declust_nn,"nn_is_background_like","Nearest-neighbour")
-bg_rate_reasenberg_monthly <- monthly_background_rate(declust_reasenberg,"reasenberg_is_background_like","Reasenberg-style")
-bg_rate_three_methods <- bind_rows(bg_rate_gk_monthly,bg_rate_nn_monthly,bg_rate_reasenberg_monthly)
-save_csv_mc(bg_rate_three_methods,"initial_background_rate_three_methods")
-
-p_bg_three <- ggplot(bg_rate_three_methods,aes(month,background_rate_per_day,linetype=method))+
-  geom_line(linewidth=.75)+labs(title="Comparison of Declustering-based Initial Background Rates",
-                                subtitle=paste0("Common input catalogue: M >= ",mc_main),x="Time",y="Background-like events per day",
-                                linetype="Declustering method")+theme_minimal()
-print(p_bg_three); save_plot_mc(p_bg_three,"initial_background_rate_three_methods",10,5)
-
-# ============================================================
-# 10. DIAGNOSTIC 4: QUANTIFY INITIALIZATION DIFFERENCES
-# ============================================================
-bgwide <- bg_rate_three_methods %>% select(month,method,background_rate_per_day) %>%
-  pivot_wider(names_from=method,values_from=background_rate_per_day)
-init_metrics <- function(x,y,n1,n2) data.frame(method_1=n1,method_2=n2,
-                                               MAE=mean(abs(x-y),na.rm=TRUE),RMSE=sqrt(mean((x-y)^2,na.rm=TRUE)),
-                                               correlation=cor(x,y,use="complete.obs"))
-init_difference_summary <- bind_rows(
-  init_metrics(bgwide[["Gardner-Knopoff"]],bgwide[["Nearest-neighbour"]],"Gardner-Knopoff","Nearest-neighbour"),
-  init_metrics(bgwide[["Gardner-Knopoff"]],bgwide[["Reasenberg-style"]],"Gardner-Knopoff","Reasenberg-style"),
-  init_metrics(bgwide[["Nearest-neighbour"]],bgwide[["Reasenberg-style"]],"Nearest-neighbour","Reasenberg-style"))
-print(init_difference_summary)
-save_csv_mc(init_difference_summary,"diagnostic_initialisation_difference_metrics")
-
-bg2019 <- bg_rate_three_methods %>% filter(year(month)==2019) %>%
-  select(month,method,background_rate_per_day) %>% pivot_wider(names_from=method,values_from=background_rate_per_day)
-init_difference_2019 <- bind_rows(
-  init_metrics(bg2019[["Gardner-Knopoff"]],bg2019[["Nearest-neighbour"]],"Gardner-Knopoff","Nearest-neighbour"),
-  init_metrics(bg2019[["Gardner-Knopoff"]],bg2019[["Reasenberg-style"]],"Gardner-Knopoff","Reasenberg-style"),
-  init_metrics(bg2019[["Nearest-neighbour"]],bg2019[["Reasenberg-style"]],"Nearest-neighbour","Reasenberg-style")) %>%
-  mutate(period="2019")
-print(init_difference_2019)
-save_csv_mc(init_difference_2019,"diagnostic_initialisation_difference_metrics_2019")
-
-# ============================================================
-# 11. OPTIONAL MINIMAL PARAMETER SENSITIVITY
-# Do NOT tune for a desired result; this is a robustness analysis.
-# ============================================================
-RUN_SENSITIVITY <- FALSE
-if (RUN_SENSITIVITY) {
-  gk_sens <- map_dfr(c(.5,1.0), function(fs){
-    z<-gardner_knopoff_declustering(catalog_main,fs)
-    data.frame(method="Gardner-Knopoff",parameter="fs_time_prop",value=fs,
-               background_fraction=mean(z$gk_is_background_like))})
-  
-  nn_sens <- map_dfr(c(1.4,1.6,1.8), function(dfv){
-    r<-compute_nearest_neighbor_eta(catalog_main,mc_main,b_catalogue,dfv)
-    mix<-fit_nn_mixture_threshold(r$nn_log_eta); z<-classify_nn_clusters(r,mix$threshold)
-    data.frame(method="Nearest-neighbour",parameter="d_f",value=dfv,threshold=mix$threshold,
-               background_fraction=mean(z$nn_is_background_like))})
-  
-  rg <- expand.grid(rfact=c(5,10,20),tau_max=c(5,10,15))
-  reas_sens <- pmap_dfr(rg,function(rfact,tau_max){
-    z<-reasenberg_style_declustering(catalog_main,1,tau_max,.95,.5,1.5,rfact)
-    data.frame(method="Reasenberg-style",rfact=rfact,tau_max=tau_max,
-               background_fraction=mean(z$reasenberg_is_background_like))})
-  
-  save_csv_mc(gk_sens,"sensitivity_gardner_knopoff")
-  save_csv_mc(nn_sens,"sensitivity_nearest_neighbor")
-  save_csv_mc(reas_sens,"sensitivity_reasenberg_style")
-}
-
-# ============================================================
-# 12. FINAL SANITY CHECKS
-# ============================================================
-stopifnot(nrow(catalog_main)==nrow(declust_gk),
-          nrow(catalog_main)==nrow(declust_nn),
-          nrow(catalog_main)==nrow(declust_reasenberg))
-cat("\nAll three methods used the same Mc=",mc_main," catalogue; N=",nrow(catalog_main),"\n",sep="")
-cat("\nOverall background fractions:\n"); print(overall_background_summary)
-cat("\nPairwise agreement:\n"); print(pairwise_agreement)
-cat("\n2019 diagnostic:\n"); print(period_summary)
-cat("\nInitialization differences:\n"); print(init_difference_summary)
-
-# ============================================================
-# STEP 4: Fit temporal non-stationary ETAS model
-# Using declustering-based initial background rates as starting values
-# ============================================================
-
-library(dplyr)
-library(lubridate)
-library(splines)
-library(ggplot2)
-library(purrr)
-
-# ------------------------------------------------------------
-# 1. Prepare full catalogue for ETAS fitting
-# IMPORTANT: "full catalogue" here means full Mc-complete catalogue,
-# not declustered catalogue.
-# ------------------------------------------------------------
-
-mc_main <- 2
 
 etas_cat <- catalog %>%
-  filter(!is.na(datetime), !is.na(mag)) %>%
-  filter(mag >= mc_main) %>%
-  arrange(datetime) %>%
+  filter(
+    !is.na(datetime),
+    !is.na(mag),
+    mag >= mc_main
+  ) %>%
+  arrange(datetime)
+
+t_origin <- min(etas_cat$datetime)
+t_end_datetime <- max(etas_cat$datetime)
+
+etas_cat <- etas_cat %>%
   mutate(
     event_id = row_number(),
-    t_days = as.numeric(difftime(datetime, min(datetime), units = "days")),
+    t_days = as.numeric(
+      difftime(datetime, t_origin, units = "days")
+    ),
     mag_excess = mag - mc_main
   )
 
 t_start <- min(etas_cat$t_days)
 t_end <- max(etas_cat$t_days)
 T_days <- t_end - t_start
+N <- nrow(etas_cat)
 
-cat("ETAS fitting catalogue:", nrow(etas_cat), "events\n")
-cat("Time span:", round(T_days, 2), "days\n")
+cat("ETAS catalogue:", N, "events\n")
+cat("Mc =", mc_main, "\n")
+cat("Duration =", round(T_days, 2), "days\n")
+
+stopifnot(all(etas_cat$mag >= mc_main))
 
 
-# ------------------------------------------------------------
-# 2. Spline basis for non-stationary background rate mu(t)
-# log(mu(t)) = B(t) %*% beta
-# ------------------------------------------------------------
+# ============================================================
+# 2. HELPER: BUILD SPLINE BASIS
+# ============================================================
 
-mu_df <- 8   # number of spline basis functions; can test 6, 8, 10
+make_spline_basis <- function(etas_cat, mu_df) {
+  
+  t_start <- min(etas_cat$t_days)
+  t_end <- max(etas_cat$t_days)
+  
+  B_event <- splines::ns(
+    etas_cat$t_days,
+    df = mu_df,
+    intercept = TRUE,
+    Boundary.knots = c(t_start, t_end)
+  )
+  
+  # Daily grid + exact catalogue endpoint
+  t_grid <- seq(t_start, t_end, by = 1)
+  
+  if (tail(t_grid, 1) < t_end) {
+    t_grid <- c(t_grid, t_end)
+  }
+  
+  B_grid <- predict(
+    B_event,
+    newx = t_grid
+  )
+  
+  list(
+    B_event = B_event,
+    B_grid = B_grid,
+    t_grid = t_grid
+  )
+}
 
-B_event <- splines::ns(
-  etas_cat$t_days,
-  df = mu_df,
-  intercept = TRUE,
-  Boundary.knots = c(t_start, t_end)
+
+basis_main <- make_spline_basis(
+  etas_cat = etas_cat,
+  mu_df = mu_df_main
 )
 
-# Daily grid for numerical integration of background rate
-t_grid <- seq(t_start, t_end, by = 1)
-
-B_grid <- predict(B_event, newx = t_grid)
-
-grid_dt <- c(diff(t_grid), 1)
+B_event <- basis_main$B_event
+B_grid <- basis_main$B_grid
+t_grid <- basis_main$t_grid
 
 
-# ------------------------------------------------------------
-# 3. Convert monthly declustering background counts into
-# starting beta values for log(mu(t))
-# ------------------------------------------------------------
+# ============================================================
+# 3. CONVERT DECLUSTERING BACKGROUND RATES TO INITIAL BETA
+# ============================================================
 
 make_initial_beta_from_bg_rate <- function(
     bg_rate_monthly,
     B_event,
     t_origin,
     t_end_datetime,
+    pseudo_count = 0.1,
     ridge = 1e-4
 ) {
   
@@ -2312,30 +2091,68 @@ make_initial_beta_from_bg_rate <- function(
     mutate(
       month_start = as.POSIXct(month),
       month_end = month_start %m+% months(1),
-      month_start_clip = pmax(month_start, t_origin),
-      month_end_clip = pmin(month_end, t_end_datetime),
-      exposure_days = as.numeric(
-        difftime(month_end_clip, month_start_clip, units = "days")
+      
+      month_start_clip = if_else(
+        month_start < t_origin,
+        t_origin,
+        month_start
       ),
-      month_mid = month_start_clip + (month_end_clip - month_start_clip) / 2,
-      t_mid_days = as.numeric(difftime(month_mid, t_origin, units = "days")),
-      # small offset avoids log(0)
-      initial_rate_per_day = (background_events + 0.1) / pmax(exposure_days, 1),
-      log_initial_rate = log(initial_rate_per_day)
+      
+      month_end_clip = if_else(
+        month_end > t_end_datetime,
+        t_end_datetime,
+        month_end
+      ),
+      
+      exposure_days = as.numeric(
+        difftime(
+          month_end_clip,
+          month_start_clip,
+          units = "days"
+        )
+      ),
+      
+      month_mid =
+        month_start_clip +
+        (month_end_clip - month_start_clip) / 2,
+      
+      t_mid_days = as.numeric(
+        difftime(
+          month_mid,
+          t_origin,
+          units = "days"
+        )
+      ),
+      
+      # Pseudo-count is used only to construct finite starting values
+      initial_rate_per_day =
+        (background_events + pseudo_count) /
+        pmax(exposure_days, 1),
+      
+      log_initial_rate =
+        log(initial_rate_per_day)
     ) %>%
     filter(
+      exposure_days > 0,
       is.finite(t_mid_days),
       t_mid_days >= 0,
       is.finite(log_initial_rate)
     )
   
-  B_mid <- predict(B_event, newx = bg$t_mid_days)
+  B_mid <- predict(
+    B_event,
+    newx = bg$t_mid_days
+  )
   
-  XtX <- t(B_mid) %*% B_mid
-  Xty <- t(B_mid) %*% bg$log_initial_rate
+  XtX <- crossprod(B_mid)
+  Xty <- crossprod(
+    B_mid,
+    bg$log_initial_rate
+  )
   
   beta_init <- solve(
-    XtX + ridge * diag(ncol(B_mid)),
+    XtX +
+      ridge * diag(ncol(B_mid)),
     Xty
   )
   
@@ -2343,53 +2160,63 @@ make_initial_beta_from_bg_rate <- function(
 }
 
 
-t_origin <- min(etas_cat$datetime)
-t_end_datetime <- max(etas_cat$datetime)
-
 beta_init_gk <- make_initial_beta_from_bg_rate(
   bg_rate_gk_monthly,
-  B_event = B_event,
-  t_origin = t_origin,
-  t_end_datetime = t_end_datetime
+  B_event,
+  t_origin,
+  t_end_datetime
 )
 
 beta_init_nn <- make_initial_beta_from_bg_rate(
   bg_rate_nn_monthly,
-  B_event = B_event,
-  t_origin = t_origin,
-  t_end_datetime = t_end_datetime
+  B_event,
+  t_origin,
+  t_end_datetime
 )
 
 beta_init_reasenberg <- make_initial_beta_from_bg_rate(
   bg_rate_reasenberg_monthly,
-  B_event = B_event,
-  t_origin = t_origin,
-  t_end_datetime = t_end_datetime
+  B_event,
+  t_origin,
+  t_end_datetime
 )
 
 
-# ------------------------------------------------------------
-# 4. Temporal ETAS negative log-likelihood
-# ------------------------------------------------------------
-# lambda(t_i) = mu(t_i) + sum_j K exp(alpha(M_j-Mc)) (t_i-t_j+c)^(-p)
-#
-# Parameter vector:
-# par = c(logK, log_alpha, log_c, log_p_minus_1, beta_1, ..., beta_df)
-#
-# K     = exp(logK)
-# alpha = exp(log_alpha)
-# c     = exp(log_c)
-# p     = 1 + exp(log_p_minus_1)
-#
-# p > 1 is imposed for finite triggering integral.
-# ------------------------------------------------------------
+# ============================================================
+# 4. NUMERICAL INTEGRATION HELPER
+# ============================================================
 
-etas_negloglik <- function(
+trapz_integral <- function(x, y) {
+  
+  if (length(x) < 2) {
+    return(0)
+  }
+  
+  sum(
+    diff(x) *
+      (head(y, -1) + tail(y, -1)) / 2
+  )
+}
+
+
+# ============================================================
+# 5. ETAS LIKELIHOOD COMPONENTS
+#
+# lambda(t_i) =
+# mu(t_i) +
+# sum_{j<i} K exp(alpha(M_j-Mc)) (t_i-t_j+c)^(-p)
+#
+# log(mu(t)) = B(t) beta
+#
+# p > 1 is imposed as a modelling constraint to ensure an
+# integrable long-term Omori tail.
+# ============================================================
+
+etas_components <- function(
     par,
     etas_cat,
     B_event,
     B_grid,
-    grid_dt,
     t_grid,
     max_trigger_days = 3650,
     penalty_lambda = 1
@@ -2399,7 +2226,7 @@ etas_negloglik <- function(
   log_alpha <- par[2]
   log_c <- par[3]
   log_p_minus_1 <- par[4]
-  beta <- par[-c(1:4)]
+  beta <- par[-(1:4)]
   
   K <- exp(logK)
   alpha <- exp(log_alpha)
@@ -2410,89 +2237,169 @@ etas_negloglik <- function(
   m_excess <- etas_cat$mag_excess
   n <- length(t)
   
-  # Background intensity at event times
-  mu_event <- as.numeric(exp(B_event %*% beta))
+  # Background intensity
+  mu_event <- as.numeric(
+    exp(B_event %*% beta)
+  )
   
-  # Background integral
-  mu_grid <- as.numeric(exp(B_grid %*% beta))
-  bg_integral <- sum(mu_grid * grid_dt)
+  mu_grid <- as.numeric(
+    exp(B_grid %*% beta)
+  )
   
-  # Triggered intensity at each event
+  bg_integral <- trapz_integral(
+    t_grid,
+    mu_grid
+  )
+  
+  # Triggering intensity at event times
   trig_event <- numeric(n)
   
-  for (i in 2:n) {
+  if (n >= 2) {
     
-    dt <- t[i] - t[1:(i - 1)]
-    
-    keep <- dt > 0 & dt <= max_trigger_days
-    
-    if (!any(keep)) {
-      trig_event[i] <- 0
-    } else {
-      prev_idx <- which(keep)
+    for (i in 2:n) {
       
-      trig_event[i] <- sum(
-        K *
-          exp(alpha * m_excess[prev_idx]) *
-          (dt[prev_idx] + c_par)^(-p_par)
+      dt <- t[i] - t[1:(i - 1)]
+      
+      keep <- (
+        dt > 0 &
+          dt <= max_trigger_days
       )
+      
+      if (any(keep)) {
+        
+        prev_idx <- which(keep)
+        
+        trig_event[i] <- sum(
+          K *
+            exp(
+              alpha *
+                m_excess[prev_idx]
+            ) *
+            (
+              dt[prev_idx] +
+                c_par
+            )^(-p_par)
+        )
+      }
     }
   }
   
-  lambda_event <- mu_event + trig_event
+  lambda_event <-
+    mu_event +
+    trig_event
   
-  # Avoid log(0)
-  if (any(!is.finite(lambda_event)) || any(lambda_event <= 0)) {
-    return(1e100)
+  if (
+    any(!is.finite(lambda_event)) ||
+    any(lambda_event <= 0)
+  ) {
+    
+    return(
+      list(
+        valid = FALSE,
+        penalized_objective = 1e100
+      )
+    )
   }
   
-  loglik_events <- sum(log(lambda_event))
+  event_loglik <-
+    sum(
+      log(lambda_event)
+    )
   
   # Triggering integral
-  # Integral from each event time to min(T, t_i + max_trigger_days)
   T_end <- max(t)
   
-  trigger_integral_each <- numeric(n)
+  upper_dt <- pmin(
+    max_trigger_days,
+    pmax(T_end - t, 0)
+  )
   
-  for (j in 1:n) {
-    
-    upper_time <- min(T_end, t[j] + max_trigger_days)
-    upper_dt <- upper_time - t[j]
-    
-    if (upper_dt <= 0) {
-      trigger_integral_each[j] <- 0
-    } else {
-      trigger_integral_each[j] <-
-        K *
-        exp(alpha * m_excess[j]) *
-        (
-          c_par^(1 - p_par) -
-            (upper_dt + c_par)^(1 - p_par)
-        ) / (p_par - 1)
-    }
-  }
+  productivity <-
+    K *
+    exp(
+      alpha *
+        m_excess
+    )
   
-  trigger_integral <- sum(trigger_integral_each)
+  trigger_integral_each <-
+    productivity *
+    (
+      c_par^(1 - p_par) -
+        (upper_dt + c_par)^(1 - p_par)
+    ) /
+    (p_par - 1)
   
-  loglik <- loglik_events - bg_integral - trigger_integral
+  trigger_integral <-
+    sum(trigger_integral_each)
   
-  # Smoothness penalty for non-stationary background
-  # This prevents monthly/spline background from becoming too wiggly.
-  penalty <- penalty_lambda * sum(diff(beta, differences = 2)^2)
+  loglik <-
+    event_loglik -
+    bg_integral -
+    trigger_integral
   
-  negloglik <- -loglik + penalty
+  # Quadratic second-difference penalty on spline coefficients
+  penalty <- penalty_lambda *
+    sum(
+      diff(
+        beta,
+        differences = 2
+      )^2
+    )
   
-  if (!is.finite(negloglik)) {
-    return(1e100)
-  }
+  penalized_objective <-
+    -loglik +
+    penalty
   
-  return(negloglik)
+  list(
+    valid = is.finite(penalized_objective),
+    loglik = loglik,
+    negloglik = -loglik,
+    penalty = penalty,
+    penalized_objective = penalized_objective,
+    K = K,
+    alpha = alpha,
+    c = c_par,
+    p = p_par,
+    beta = beta,
+    mu_event = mu_event,
+    mu_grid = mu_grid,
+    bg_integral = bg_integral,
+    trigger_integral = trigger_integral
+  )
 }
 
 
-# ------------------------------------------------------------
-# 5. Fit ETAS model from one declustering-based starting value
-# ------------------------------------------------------------
+etas_objective <- function(
+    par,
+    etas_cat,
+    B_event,
+    B_grid,
+    t_grid,
+    max_trigger_days,
+    penalty_lambda
+) {
+  
+  comp <- etas_components(
+    par = par,
+    etas_cat = etas_cat,
+    B_event = B_event,
+    B_grid = B_grid,
+    t_grid = t_grid,
+    max_trigger_days = max_trigger_days,
+    penalty_lambda = penalty_lambda
+  )
+  
+  if (!isTRUE(comp$valid)) {
+    return(1e100)
+  }
+  
+  comp$penalized_objective
+}
+
+
+# ============================================================
+# 6. FIT ONE ETAS MODEL FROM A SPECIFIED BACKGROUND START
+# ============================================================
 
 fit_etas_from_start <- function(
     beta_init,
@@ -2500,15 +2407,14 @@ fit_etas_from_start <- function(
     etas_cat,
     B_event,
     B_grid,
-    grid_dt,
     t_grid,
     max_trigger_days = 3650,
     penalty_lambda = 1,
-    maxit = 300
+    maxit = 300,
+    trace = 1
 ) {
   
-  # Starting values for triggering parameters
-  # These are starting values only; likelihood optimization updates them.
+  # Common triggering starting values
   K0 <- 0.02
   alpha0 <- 1.0
   c0 <- 0.01
@@ -2523,67 +2429,109 @@ fit_etas_from_start <- function(
   )
   
   lower <- c(
-    log(1e-6),     # K
-    log(0.05),     # alpha
-    log(1e-4),     # c
-    log(0.001),    # p - 1
+    log(1e-6),
+    log(0.05),
+    log(1e-4),
+    log(0.001),
     rep(-20, length(beta_init))
   )
   
   upper <- c(
-    log(10),       # K
-    log(5),        # alpha
-    log(10),       # c
-    log(5),        # p - 1
+    log(10),
+    log(5),
+    log(10),
+    log(5),
     rep(5, length(beta_init))
   )
   
-  cat("\nFitting ETAS model using starting background from:",
-      method_name, "\n")
+  cat(
+    "\n----------------------------------------\n",
+    "Fitting ETAS from: ", method_name, "\n",
+    "----------------------------------------\n",
+    sep = ""
+  )
+  
+  start_time <- Sys.time()
   
   fit <- optim(
     par = par0,
-    fn = etas_negloglik,
+    fn = etas_objective,
     method = "L-BFGS-B",
     lower = lower,
     upper = upper,
     control = list(
       maxit = maxit,
-      trace = 1,
+      trace = trace,
       REPORT = 5
     ),
     etas_cat = etas_cat,
     B_event = B_event,
     B_grid = B_grid,
-    grid_dt = grid_dt,
     t_grid = t_grid,
     max_trigger_days = max_trigger_days,
     penalty_lambda = penalty_lambda
   )
   
-  par_hat <- fit$par
-  
-  result <- list(
-    method = method_name,
-    fit = fit,
-    par_hat = par_hat,
-    K = exp(par_hat[1]),
-    alpha = exp(par_hat[2]),
-    c = exp(par_hat[3]),
-    p = 1 + exp(par_hat[4]),
-    beta = par_hat[-c(1:4)],
-    negloglik = fit$value,
-    convergence = fit$convergence,
-    message = fit$message
+  runtime_min <- as.numeric(
+    difftime(
+      Sys.time(),
+      start_time,
+      units = "mins"
+    )
   )
   
-  return(result)
+  final_comp <- etas_components(
+    par = fit$par,
+    etas_cat = etas_cat,
+    B_event = B_event,
+    B_grid = B_grid,
+    t_grid = t_grid,
+    max_trigger_days = max_trigger_days,
+    penalty_lambda = penalty_lambda
+  )
+  
+  list(
+    method = method_name,
+    fit = fit,
+    
+    par_hat = fit$par,
+    
+    K = final_comp$K,
+    alpha = final_comp$alpha,
+    c = final_comp$c,
+    p = final_comp$p,
+    
+    beta = final_comp$beta,
+    
+    logLik = final_comp$loglik,
+    negloglik = final_comp$negloglik,
+    
+    penalty = final_comp$penalty,
+    
+    penalized_objective =
+      final_comp$penalized_objective,
+    
+    mu_grid = final_comp$mu_grid,
+    
+    bg_integral =
+      final_comp$bg_integral,
+    
+    trigger_integral =
+      final_comp$trigger_integral,
+    
+    convergence = fit$convergence,
+    message = fit$message,
+    
+    runtime_minutes =
+      runtime_min
+  )
 }
 
 
-# ------------------------------------------------------------
-# 6. Fit three ETAS models using three different initial values
-# ------------------------------------------------------------
+# ============================================================
+# 7. MAIN EXPERIMENT:
+# THREE DECLUSTERING-BASED STARTING BACKGROUNDS
+# ============================================================
 
 fit_gk <- fit_etas_from_start(
   beta_init = beta_init_gk,
@@ -2591,11 +2539,10 @@ fit_gk <- fit_etas_from_start(
   etas_cat = etas_cat,
   B_event = B_event,
   B_grid = B_grid,
-  grid_dt = grid_dt,
   t_grid = t_grid,
-  max_trigger_days = 3650,
-  penalty_lambda = 1,
-  maxit = 300
+  max_trigger_days = max_trigger_days_main,
+  penalty_lambda = penalty_lambda_main,
+  maxit = maxit_main
 )
 
 fit_nn <- fit_etas_from_start(
@@ -2604,11 +2551,10 @@ fit_nn <- fit_etas_from_start(
   etas_cat = etas_cat,
   B_event = B_event,
   B_grid = B_grid,
-  grid_dt = grid_dt,
   t_grid = t_grid,
-  max_trigger_days = 3650,
-  penalty_lambda = 1,
-  maxit = 300
+  max_trigger_days = max_trigger_days_main,
+  penalty_lambda = penalty_lambda_main,
+  maxit = maxit_main
 )
 
 fit_reasenberg <- fit_etas_from_start(
@@ -2617,44 +2563,1097 @@ fit_reasenberg <- fit_etas_from_start(
   etas_cat = etas_cat,
   B_event = B_event,
   B_grid = B_grid,
-  grid_dt = grid_dt,
   t_grid = t_grid,
-  max_trigger_days = 3650,
-  penalty_lambda = 1,
-  maxit = 300
+  max_trigger_days = max_trigger_days_main,
+  penalty_lambda = penalty_lambda_main,
+  maxit = maxit_main
 )
 
 
-# ------------------------------------------------------------
-# 7. Compare convergence and fitted ETAS parameters
-# ------------------------------------------------------------
+# ============================================================
+# 8. COMPARE FINAL TRIGGERING PARAMETERS AND LIKELIHOOD
+# ============================================================
 
-etas_fit_summary <- data.frame(
-  method = c(
-    fit_gk$method,
-    fit_nn$method,
-    fit_reasenberg$method
+etas_fit_summary <- bind_rows(
+  data.frame(
+    method = fit_gk$method,
+    convergence = fit_gk$convergence,
+    logLik = fit_gk$logLik,
+    negloglik = fit_gk$negloglik,
+    penalty = fit_gk$penalty,
+    penalized_objective =
+      fit_gk$penalized_objective,
+    K = fit_gk$K,
+    alpha = fit_gk$alpha,
+    c = fit_gk$c,
+    p = fit_gk$p,
+    runtime_minutes =
+      fit_gk$runtime_minutes
   ),
-  convergence = c(
-    fit_gk$convergence,
-    fit_nn$convergence,
-    fit_reasenberg$convergence
+  
+  data.frame(
+    method = fit_nn$method,
+    convergence = fit_nn$convergence,
+    logLik = fit_nn$logLik,
+    negloglik = fit_nn$negloglik,
+    penalty = fit_nn$penalty,
+    penalized_objective =
+      fit_nn$penalized_objective,
+    K = fit_nn$K,
+    alpha = fit_nn$alpha,
+    c = fit_nn$c,
+    p = fit_nn$p,
+    runtime_minutes =
+      fit_nn$runtime_minutes
   ),
-  negloglik = c(
-    fit_gk$negloglik,
-    fit_nn$negloglik,
-    fit_reasenberg$negloglik
-  ),
-  K = c(fit_gk$K, fit_nn$K, fit_reasenberg$K),
-  alpha = c(fit_gk$alpha, fit_nn$alpha, fit_reasenberg$alpha),
-  c = c(fit_gk$c, fit_nn$c, fit_reasenberg$c),
-  p = c(fit_gk$p, fit_nn$p, fit_reasenberg$p)
+  
+  data.frame(
+    method = fit_reasenberg$method,
+    convergence =
+      fit_reasenberg$convergence,
+    logLik =
+      fit_reasenberg$logLik,
+    negloglik =
+      fit_reasenberg$negloglik,
+    penalty =
+      fit_reasenberg$penalty,
+    penalized_objective =
+      fit_reasenberg$penalized_objective,
+    K =
+      fit_reasenberg$K,
+    alpha =
+      fit_reasenberg$alpha,
+    c =
+      fit_reasenberg$c,
+    p =
+      fit_reasenberg$p,
+    runtime_minutes =
+      fit_reasenberg$runtime_minutes
+  )
 )
 
 print(etas_fit_summary)
 
 write.csv(
   etas_fit_summary,
-  "nonstationary_ETAS_fit_summary_three_initializations_Mc_1_7.csv",
+  "nonstationary_ETAS_fit_summary_three_initializations_Mc_2_0.csv",
   row.names = FALSE
 )
+
+
+# ============================================================
+# 9. FINAL FITTED BACKGROUND-RATE TRAJECTORIES
+# ============================================================
+
+mu_final <- bind_rows(
+  data.frame(
+    t_days = t_grid,
+    mu = fit_gk$mu_grid,
+    method = "Gardner-Knopoff"
+  ),
+  
+  data.frame(
+    t_days = t_grid,
+    mu = fit_nn$mu_grid,
+    method = "Nearest-neighbour"
+  ),
+  
+  data.frame(
+    t_days = t_grid,
+    mu = fit_reasenberg$mu_grid,
+    method = "Reasenberg-style"
+  )
+) %>%
+  mutate(
+    datetime =
+      t_origin +
+      t_days * 24 * 3600
+  )
+
+write.csv(
+  mu_final,
+  "nonstationary_ETAS_final_background_rates_Mc_2_0.csv",
+  row.names = FALSE
+)
+
+
+p_mu_final <- ggplot(
+  mu_final,
+  aes(
+    x = datetime,
+    y = mu,
+    linetype = method
+  )
+) +
+  geom_line(
+    linewidth = 0.75
+  ) +
+  labs(
+    title =
+      "Final Fitted Non-stationary ETAS Background Rates",
+    subtitle =
+      "Three declustering-based starting values; common ETAS model",
+    x = "Time",
+    y = "Fitted background rate (events/day)",
+    linetype = "Initialisation"
+  ) +
+  theme_minimal()
+
+print(p_mu_final)
+
+ggsave(
+  "nonstationary_ETAS_final_background_rates_Mc_2_0.png",
+  p_mu_final,
+  width = 10,
+  height = 5,
+  dpi = 300
+)
+
+
+# ============================================================
+# 10. QUANTIFY FINAL BACKGROUND-RATE DIFFERENCES
+# ============================================================
+
+trajectory_metrics <- function(
+    x,
+    y,
+    method_1,
+    method_2
+) {
+  
+  data.frame(
+    method_1 = method_1,
+    method_2 = method_2,
+    
+    MAE =
+      mean(
+        abs(x - y),
+        na.rm = TRUE
+      ),
+    
+    RMSE =
+      sqrt(
+        mean(
+          (x - y)^2,
+          na.rm = TRUE
+        )
+      ),
+    
+    correlation =
+      cor(
+        x,
+        y,
+        use = "complete.obs"
+      )
+  )
+}
+
+
+mu_final_wide <- mu_final %>%
+  select(
+    t_days,
+    method,
+    mu
+  ) %>%
+  pivot_wider(
+    names_from = method,
+    values_from = mu
+  )
+
+
+final_mu_difference_summary <- bind_rows(
+  
+  trajectory_metrics(
+    mu_final_wide[["Gardner-Knopoff"]],
+    mu_final_wide[["Nearest-neighbour"]],
+    "Gardner-Knopoff",
+    "Nearest-neighbour"
+  ),
+  
+  trajectory_metrics(
+    mu_final_wide[["Gardner-Knopoff"]],
+    mu_final_wide[["Reasenberg-style"]],
+    "Gardner-Knopoff",
+    "Reasenberg-style"
+  ),
+  
+  trajectory_metrics(
+    mu_final_wide[["Nearest-neighbour"]],
+    mu_final_wide[["Reasenberg-style"]],
+    "Nearest-neighbour",
+    "Reasenberg-style"
+  )
+)
+
+print(final_mu_difference_summary)
+
+write.csv(
+  final_mu_difference_summary,
+  "nonstationary_ETAS_final_background_difference_metrics_Mc_2_0.csv",
+  row.names = FALSE
+)
+
+
+# ============================================================
+# 11. CHECK WHETHER INITIALISATION DIFFERENCES SURVIVED
+#
+# Assumes init_difference_summary already exists from STEP 3.
+# ============================================================
+
+if (exists("init_difference_summary")) {
+  
+  propagation_summary <-
+    init_difference_summary %>%
+    
+    rename(
+      initial_MAE = MAE,
+      initial_RMSE = RMSE,
+      initial_correlation = correlation
+    ) %>%
+    
+    left_join(
+      final_mu_difference_summary %>%
+        rename(
+          final_MAE = MAE,
+          final_RMSE = RMSE,
+          final_correlation = correlation
+        ),
+      by = c(
+        "method_1",
+        "method_2"
+      )
+    ) %>%
+    
+    mutate(
+      MAE_ratio_final_to_initial =
+        final_MAE /
+        initial_MAE,
+      
+      RMSE_ratio_final_to_initial =
+        final_RMSE /
+        initial_RMSE
+    )
+  
+  print(propagation_summary)
+  
+  write.csv(
+    propagation_summary,
+    "ETAS_initial_to_final_background_propagation_Mc_2_0.csv",
+    row.names = FALSE
+  )
+}
+
+
+# ============================================================
+# 12. BASIC SANITY CHECKS
+# ============================================================
+
+cat("\nConvergence codes:\n")
+print(
+  etas_fit_summary %>%
+    select(
+      method,
+      convergence,
+      logLik,
+      penalized_objective
+    )
+)
+
+if (
+  any(
+    etas_fit_summary$convergence != 0
+  )
+) {
+  warning(
+    "At least one ETAS fit did not return convergence code 0."
+  )
+}
+
+
+# ============================================================
+# 13. OPTIONAL: EXTRA STARTING-VALUE ROBUSTNESS
+#
+# Purpose:
+# distinguish declustering-specific initialisation sensitivity
+# from generic optimiser / local-optimum sensitivity.
+# ============================================================
+
+if (RUN_EXTRA_STARTS) {
+  
+  set.seed(123)
+  
+  # Neutral approximately constant background start
+  neutral_rate <- max(
+    N / T_days * 0.2,
+    1e-6
+  )
+  
+  beta_neutral <- make_initial_beta_from_bg_rate(
+    bg_rate_monthly =
+      bg_rate_gk_monthly %>%
+      mutate(
+        background_events =
+          neutral_rate *
+          days_in_month(month)
+      ),
+    B_event = B_event,
+    t_origin = t_origin,
+    t_end_datetime =
+      t_end_datetime
+  )
+  
+  fit_neutral <- fit_etas_from_start(
+    beta_init = beta_neutral,
+    method_name = "Neutral-start",
+    etas_cat = etas_cat,
+    B_event = B_event,
+    B_grid = B_grid,
+    t_grid = t_grid,
+    max_trigger_days =
+      max_trigger_days_main,
+    penalty_lambda =
+      penalty_lambda_main,
+    maxit = maxit_main
+  )
+  
+  # Jitter around the three declustering starts
+  jitter_sd <- 0.2
+  
+  jitter_starts <- list(
+    GK_jitter =
+      beta_init_gk +
+      rnorm(
+        length(beta_init_gk),
+        0,
+        jitter_sd
+      ),
+    
+    NN_jitter =
+      beta_init_nn +
+      rnorm(
+        length(beta_init_nn),
+        0,
+        jitter_sd
+      ),
+    
+    Reasenberg_jitter =
+      beta_init_reasenberg +
+      rnorm(
+        length(beta_init_reasenberg),
+        0,
+        jitter_sd
+      )
+  )
+  
+  extra_fits <- lapply(
+    names(jitter_starts),
+    function(nm) {
+      
+      fit_etas_from_start(
+        beta_init =
+          jitter_starts[[nm]],
+        method_name =
+          nm,
+        etas_cat =
+          etas_cat,
+        B_event =
+          B_event,
+        B_grid =
+          B_grid,
+        t_grid =
+          t_grid,
+        max_trigger_days =
+          max_trigger_days_main,
+        penalty_lambda =
+          penalty_lambda_main,
+        maxit =
+          maxit_main,
+        trace = 0
+      )
+    }
+  )
+  
+  extra_start_summary <- bind_rows(
+    data.frame(
+      method =
+        fit_neutral$method,
+      convergence =
+        fit_neutral$convergence,
+      logLik =
+        fit_neutral$logLik,
+      penalized_objective =
+        fit_neutral$penalized_objective
+    ),
+    
+    bind_rows(
+      lapply(
+        extra_fits,
+        function(z) {
+          data.frame(
+            method =
+              z$method,
+            convergence =
+              z$convergence,
+            logLik =
+              z$logLik,
+            penalized_objective =
+              z$penalized_objective
+          )
+        }
+      )
+    )
+  )
+  
+  print(extra_start_summary)
+  
+  write.csv(
+    extra_start_summary,
+    "ETAS_extra_starting_value_robustness_Mc_2_0.csv",
+    row.names = FALSE
+  )
+}
+
+
+# ============================================================
+# 14. OPTIONAL: MODEL-SPECIFICATION ROBUSTNESS
+#
+# Expensive. Run only after the baseline model is stable.
+# ============================================================
+
+if (RUN_MODEL_ROBUSTNESS) {
+  
+  robustness_grid <- expand.grid(
+    mu_df = c(6, 8, 10),
+    penalty_lambda = c(0.1, 1, 10),
+    max_trigger_days = c(3650, 7300),
+    stringsAsFactors = FALSE
+  )
+  
+  robustness_results <- list()
+  
+  for (
+    r in seq_len(
+      nrow(
+        robustness_grid
+      )
+    )
+  ) {
+    
+    cfg <- robustness_grid[r, ]
+    
+    cat(
+      "\nRobustness run",
+      r,
+      "/",
+      nrow(robustness_grid),
+      "\n"
+    )
+    
+    basis_r <- make_spline_basis(
+      etas_cat,
+      cfg$mu_df
+    )
+    
+    beta_r <- make_initial_beta_from_bg_rate(
+      bg_rate_nn_monthly,
+      basis_r$B_event,
+      t_origin,
+      t_end_datetime
+    )
+    
+    fit_r <- fit_etas_from_start(
+      beta_init = beta_r,
+      method_name = paste0(
+        "df", cfg$mu_df,
+        "_pen", cfg$penalty_lambda,
+        "_cut", cfg$max_trigger_days
+      ),
+      etas_cat = etas_cat,
+      B_event = basis_r$B_event,
+      B_grid = basis_r$B_grid,
+      t_grid = basis_r$t_grid,
+      max_trigger_days =
+        cfg$max_trigger_days,
+      penalty_lambda =
+        cfg$penalty_lambda,
+      maxit =
+        maxit_main,
+      trace = 0
+    )
+    
+    robustness_results[[r]] <- data.frame(
+      mu_df =
+        cfg$mu_df,
+      penalty_lambda =
+        cfg$penalty_lambda,
+      max_trigger_days =
+        cfg$max_trigger_days,
+      convergence =
+        fit_r$convergence,
+      logLik =
+        fit_r$logLik,
+      penalized_objective =
+        fit_r$penalized_objective,
+      K =
+        fit_r$K,
+      alpha =
+        fit_r$alpha,
+      c =
+        fit_r$c,
+      p =
+        fit_r$p
+    )
+  }
+  
+  robustness_summary <-
+    bind_rows(
+      robustness_results
+    )
+  
+  print(
+    robustness_summary
+  )
+  
+  write.csv(
+    robustness_summary,
+    "nonstationary_ETAS_model_specification_robustness_Mc_2_0.csv",
+    row.names = FALSE
+  )
+}
+
+
+cat(
+  "\nSTEP 4 completed.\n"
+)
+
+
+
+#check
+cbind(
+  GK = beta_init_gk,
+  NN = beta_init_nn,
+  Reasenberg = beta_init_reasenberg
+)
+max(abs(beta_init_gk - beta_init_nn))
+max(abs(beta_init_gk - beta_init_reasenberg))
+max(abs(beta_init_nn - beta_init_reasenberg))
+
+
+# ============================================================
+# SMALL ETAS MODEL-SPECIFICATION ROBUSTNESS CHECK
+#
+# Purpose:
+# Check whether the main fitted ETAS solution depends strongly on:
+#   1. spline flexibility (df)
+#   2. triggering-history cutoff
+#
+# IMPORTANT:
+# - Use ONE fixed declustering-derived initialization (NN)
+# - Baseline fit_nn is reused; it is NOT refitted
+# - This is model-specification robustness, not declustering sensitivity
+#
+# Baseline:
+#   mu_df = 8
+#   penalty_lambda = 1
+#   max_trigger_days = 3650
+#
+# Additional runs:
+#   A. df = 6
+#   B. df = 10
+#   C. cutoff = 7300 days
+# ============================================================
+
+
+# ------------------------------------------------------------
+# 0. Baseline settings
+# ------------------------------------------------------------
+
+baseline_df <- 8
+baseline_penalty <- 1
+baseline_cutoff <- 3650
+
+cat(
+  "\n========================================\n",
+  "SMALL ETAS SPECIFICATION ROBUSTNESS\n",
+  "Reference initialization: Nearest-neighbour\n",
+  "Baseline: df=8, penalty=1, cutoff=3650 days\n",
+  "========================================\n",
+  sep = ""
+)
+
+
+# ============================================================
+# 1. ROBUSTNESS RUN A:
+# LOWER SPLINE FLEXIBILITY — df = 6
+# ============================================================
+
+cat("\n[1/3] Fitting robustness model: df = 6\n")
+
+basis_df6 <- make_spline_basis(
+  etas_cat = etas_cat,
+  mu_df = 6
+)
+
+beta_init_df6 <- make_initial_beta_from_bg_rate(
+  bg_rate_monthly = bg_rate_nn_monthly,
+  B_event = basis_df6$B_event,
+  t_origin = t_origin,
+  t_end_datetime = t_end_datetime
+)
+
+fit_df6 <- fit_etas_from_start(
+  beta_init = beta_init_df6,
+  method_name = "NN_start_df6",
+  etas_cat = etas_cat,
+  B_event = basis_df6$B_event,
+  B_grid = basis_df6$B_grid,
+  t_grid = basis_df6$t_grid,
+  max_trigger_days = baseline_cutoff,
+  penalty_lambda = baseline_penalty,
+  maxit = 300,
+  trace = 1
+)
+
+
+# ============================================================
+# 2. ROBUSTNESS RUN B:
+# HIGHER SPLINE FLEXIBILITY — df = 10
+# ============================================================
+
+cat("\n[2/3] Fitting robustness model: df = 10\n")
+
+basis_df10 <- make_spline_basis(
+  etas_cat = etas_cat,
+  mu_df = 10
+)
+
+beta_init_df10 <- make_initial_beta_from_bg_rate(
+  bg_rate_monthly = bg_rate_nn_monthly,
+  B_event = basis_df10$B_event,
+  t_origin = t_origin,
+  t_end_datetime = t_end_datetime
+)
+
+fit_df10 <- fit_etas_from_start(
+  beta_init = beta_init_df10,
+  method_name = "NN_start_df10",
+  etas_cat = etas_cat,
+  B_event = basis_df10$B_event,
+  B_grid = basis_df10$B_grid,
+  t_grid = basis_df10$t_grid,
+  max_trigger_days = baseline_cutoff,
+  penalty_lambda = baseline_penalty,
+  maxit = 300,
+  trace = 1
+)
+
+
+# ============================================================
+# 3. ROBUSTNESS RUN C:
+# LONGER TRIGGERING HISTORY — 7300 days (~20 years)
+# ============================================================
+
+cat("\n[3/3] Fitting robustness model: cutoff = 7300 days\n")
+
+# Same spline specification as baseline
+basis_cut7300 <- make_spline_basis(
+  etas_cat = etas_cat,
+  mu_df = baseline_df
+)
+
+beta_init_cut7300 <- make_initial_beta_from_bg_rate(
+  bg_rate_monthly = bg_rate_nn_monthly,
+  B_event = basis_cut7300$B_event,
+  t_origin = t_origin,
+  t_end_datetime = t_end_datetime
+)
+
+fit_cut7300 <- fit_etas_from_start(
+  beta_init = beta_init_cut7300,
+  method_name = "NN_start_cutoff7300",
+  etas_cat = etas_cat,
+  B_event = basis_cut7300$B_event,
+  B_grid = basis_cut7300$B_grid,
+  t_grid = basis_cut7300$t_grid,
+  max_trigger_days = 7300,
+  penalty_lambda = baseline_penalty,
+  maxit = 300,
+  trace = 1
+)
+
+
+# ============================================================
+# 4. COMBINE BASELINE + ROBUSTNESS RESULTS
+# ============================================================
+
+robustness_summary <- bind_rows(
+  
+  # Existing baseline NN fit
+  data.frame(
+    specification = "Baseline",
+    mu_df = 8,
+    penalty_lambda = 1,
+    max_trigger_days = 3650,
+    convergence = fit_nn$convergence,
+    logLik = fit_nn$logLik,
+    penalized_objective =
+      fit_nn$penalized_objective,
+    K = fit_nn$K,
+    alpha = fit_nn$alpha,
+    c = fit_nn$c,
+    p = fit_nn$p,
+    runtime_minutes =
+      fit_nn$runtime_minutes
+  ),
+  
+  data.frame(
+    specification = "df_6",
+    mu_df = 6,
+    penalty_lambda = 1,
+    max_trigger_days = 3650,
+    convergence = fit_df6$convergence,
+    logLik = fit_df6$logLik,
+    penalized_objective =
+      fit_df6$penalized_objective,
+    K = fit_df6$K,
+    alpha = fit_df6$alpha,
+    c = fit_df6$c,
+    p = fit_df6$p,
+    runtime_minutes =
+      fit_df6$runtime_minutes
+  ),
+  
+  data.frame(
+    specification = "df_10",
+    mu_df = 10,
+    penalty_lambda = 1,
+    max_trigger_days = 3650,
+    convergence = fit_df10$convergence,
+    logLik = fit_df10$logLik,
+    penalized_objective =
+      fit_df10$penalized_objective,
+    K = fit_df10$K,
+    alpha = fit_df10$alpha,
+    c = fit_df10$c,
+    p = fit_df10$p,
+    runtime_minutes =
+      fit_df10$runtime_minutes
+  ),
+  
+  data.frame(
+    specification = "cutoff_7300",
+    mu_df = 8,
+    penalty_lambda = 1,
+    max_trigger_days = 7300,
+    convergence =
+      fit_cut7300$convergence,
+    logLik =
+      fit_cut7300$logLik,
+    penalized_objective =
+      fit_cut7300$penalized_objective,
+    K =
+      fit_cut7300$K,
+    alpha =
+      fit_cut7300$alpha,
+    c =
+      fit_cut7300$c,
+    p =
+      fit_cut7300$p,
+    runtime_minutes =
+      fit_cut7300$runtime_minutes
+  )
+)
+
+cat("\n========================================\n")
+cat("ROBUSTNESS SUMMARY\n")
+cat("========================================\n")
+
+print(robustness_summary)
+
+
+write.csv(
+  robustness_summary,
+  "ETAS_small_specification_robustness_Mc_2_0.csv",
+  row.names = FALSE
+)
+
+
+# ============================================================
+# 5. CALCULATE PARAMETER CHANGE RELATIVE TO BASELINE
+# ============================================================
+
+baseline_row <-
+  robustness_summary %>%
+  filter(specification == "Baseline")
+
+
+robustness_parameter_changes <-
+  robustness_summary %>%
+  
+  mutate(
+    
+    K_pct_change =
+      100 *
+      (K - baseline_row$K) /
+      baseline_row$K,
+    
+    alpha_pct_change =
+      100 *
+      (alpha - baseline_row$alpha) /
+      baseline_row$alpha,
+    
+    c_pct_change =
+      100 *
+      (c - baseline_row$c) /
+      baseline_row$c,
+    
+    p_pct_change =
+      100 *
+      (p - baseline_row$p) /
+      baseline_row$p,
+    
+    logLik_difference =
+      logLik -
+      baseline_row$logLik
+  )
+
+
+cat("\n========================================\n")
+cat("CHANGE RELATIVE TO BASELINE\n")
+cat("========================================\n")
+
+print(
+  robustness_parameter_changes %>%
+    select(
+      specification,
+      convergence,
+      K_pct_change,
+      alpha_pct_change,
+      c_pct_change,
+      p_pct_change,
+      logLik_difference
+    )
+)
+
+
+write.csv(
+  robustness_parameter_changes,
+  "ETAS_small_specification_parameter_changes_Mc_2_0.csv",
+  row.names = FALSE
+)
+
+
+# ============================================================
+# 6. COMPARE FINAL FITTED BACKGROUND mu(t)
+# ============================================================
+
+mu_robustness <- bind_rows(
+  
+  data.frame(
+    t_days = t_grid,
+    mu = fit_nn$mu_grid,
+    specification = "Baseline"
+  ),
+  
+  data.frame(
+    t_days = basis_df6$t_grid,
+    mu = fit_df6$mu_grid,
+    specification = "df = 6"
+  ),
+  
+  data.frame(
+    t_days = basis_df10$t_grid,
+    mu = fit_df10$mu_grid,
+    specification = "df = 10"
+  ),
+  
+  data.frame(
+    t_days = basis_cut7300$t_grid,
+    mu = fit_cut7300$mu_grid,
+    specification = "cutoff = 7300"
+  )
+) %>%
+  
+  mutate(
+    datetime =
+      t_origin +
+      t_days * 24 * 3600
+  )
+
+
+write.csv(
+  mu_robustness,
+  "ETAS_small_specification_background_rates_Mc_2_0.csv",
+  row.names = FALSE
+)
+
+
+# ============================================================
+# 7. PLOT ROBUSTNESS OF FINAL BACKGROUND RATE
+# ============================================================
+
+p_robustness_mu <- ggplot(
+  mu_robustness,
+  aes(
+    x = datetime,
+    y = mu,
+    linetype = specification
+  )
+) +
+  
+  geom_line(
+    linewidth = 0.75
+  ) +
+  
+  labs(
+    title =
+      "ETAS Background-Rate Specification Robustness",
+    
+    subtitle =
+      "Fixed nearest-neighbour initialization",
+    
+    x = "Time",
+    
+    y =
+      "Fitted background rate (events/day)",
+    
+    linetype =
+      "Specification"
+  ) +
+  
+  theme_minimal()
+
+
+print(p_robustness_mu)
+
+
+ggsave(
+  "ETAS_small_specification_background_rates_Mc_2_0.png",
+  p_robustness_mu,
+  width = 10,
+  height = 5,
+  dpi = 300
+)
+
+
+# ============================================================
+# 8. NUMERIC DIFFERENCES IN FINAL mu(t)
+# ============================================================
+
+trajectory_metrics <- function(
+    x,
+    y,
+    reference,
+    comparison
+) {
+  
+  data.frame(
+    reference = reference,
+    comparison = comparison,
+    
+    MAE =
+      mean(
+        abs(x - y),
+        na.rm = TRUE
+      ),
+    
+    RMSE =
+      sqrt(
+        mean(
+          (x - y)^2,
+          na.rm = TRUE
+        )
+      ),
+    
+    correlation =
+      cor(
+        x,
+        y,
+        use = "complete.obs"
+      )
+  )
+}
+
+
+mu_wide <-
+  mu_robustness %>%
+  
+  select(
+    t_days,
+    specification,
+    mu
+  ) %>%
+  
+  pivot_wider(
+    names_from = specification,
+    values_from = mu
+  )
+
+
+mu_robustness_metrics <- bind_rows(
+  
+  trajectory_metrics(
+    mu_wide[["Baseline"]],
+    mu_wide[["df = 6"]],
+    "Baseline",
+    "df = 6"
+  ),
+  
+  trajectory_metrics(
+    mu_wide[["Baseline"]],
+    mu_wide[["df = 10"]],
+    "Baseline",
+    "df = 10"
+  ),
+  
+  trajectory_metrics(
+    mu_wide[["Baseline"]],
+    mu_wide[["cutoff = 7300"]],
+    "Baseline",
+    "cutoff = 7300"
+  )
+)
+
+
+cat("\n========================================\n")
+cat("FINAL mu(t) ROBUSTNESS METRICS\n")
+cat("========================================\n")
+
+print(
+  mu_robustness_metrics
+)
+
+
+write.csv(
+  mu_robustness_metrics,
+  "ETAS_small_specification_mu_difference_metrics_Mc_2_0.csv",
+  row.names = FALSE
+)
+
+
+# ============================================================
+# 9. BASIC CONVERGENCE CHECK
+# ============================================================
+
+if (
+  any(
+    robustness_summary$convergence != 0
+  )
+) {
+  
+  warning(
+    "At least one robustness model did not converge."
+  )
+  
+} else {
+  
+  cat(
+    "\nAll robustness models returned convergence code 0.\n"
+  )
+}
+
+
+cat(
+  "\nSmall ETAS specification robustness analysis completed.\n"
+)
+

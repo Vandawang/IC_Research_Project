@@ -1,0 +1,4 @@
+"method_1","method_2","raw_agreement","jaccard_background","kappa","n_disagree","disagreement_percentage"
+"Gardner-Knopoff","Nearest-neighbour",0.85230485960413,0.523040985347207,0.599563135338121,2246,14.769514039587
+"Gardner-Knopoff","Reasenberg-style",0.901887288748603,0.624086671705719,0.709220335528385,1492,9.81127112513974
+"Nearest-neighbour","Reasenberg-style",0.915170645097652,0.734294541709578,0.788742259467702,1290,8.48293549023476
