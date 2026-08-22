@@ -510,8 +510,8 @@ print(head(temporal_mc_results))
 
 # Plot temporal Mc
 temporal_mc_long <- temporal_mc_results %>%
-  select( center_time,mc_maxc, mc_mbs) %>%
-  pivot_longer( cols = c(mc_maxc, mc_mbs),names_to = "method",values_to = "mc")
+  select( center_time, mc_mbs) %>%
+  pivot_longer( cols = c(mc_mbs),names_to = "method",values_to = "mc")
 
 p_temporal_mc <- ggplot(temporal_mc_long,
                         aes(x = center_time, y = mc, linetype = method)) +
@@ -537,7 +537,7 @@ p_temporal_mc_2019 <- ggplot(temporal_mc_long,
             alpha = 0.08) +
   geom_hline(yintercept = 1.7,linetype = "dotted") +
   geom_hline( yintercept = 2.0, linetype = "dashed" ) +
-  labs(title = "Temporal Mc with 2019 Highlighted",
+  labs(title = "Rolling MBS-WW estimates of magnitude completeness through time",
        subtitle = "Shaded interval indicates 2019",
        x = "Time",y = "Estimated Mc",linetype = "Method" ) +
   theme_minimal()
