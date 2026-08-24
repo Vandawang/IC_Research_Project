@@ -43,7 +43,7 @@ write.csv(annual_counts,"annual_event_counts.csv",row.names = FALSE)
 
 p_annual <- ggplot(annual_counts, aes(x = year, y = n_events)) +
   geom_col() +
-  labs(title = "Annual Number of Earthquakes",x = "Year",y = "Number of events") +
+  labs(x = "Year",y = "Number of events") +
   theme_minimal()
 
 print(p_annual)
@@ -537,9 +537,7 @@ p_temporal_mc_2019 <- ggplot(temporal_mc_long,
             alpha = 0.08) +
   geom_hline(yintercept = 1.7,linetype = "dotted") +
   geom_hline( yintercept = 2.0, linetype = "dashed" ) +
-  labs(title = "Rolling MBS-WW estimates of magnitude completeness through time",
-       subtitle = "Shaded interval indicates 2019",
-       x = "Time",y = "Estimated Mc",linetype = "Method" ) +
+  labs(x = "Time",y = "Estimated Mc",linetype = "Method" ) +
   theme_minimal()
 
 print(p_temporal_mc_2019)
