@@ -1,0 +1,168 @@
+% Complete replacement for the template Abstract and Introduction.
+% The abstract contains fewer than 300 words, excluding LaTeX commands.
+% Citation keys already present in refs.bib are listed in the accompanying
+% references_to_add.bib file; only genuinely new entries need to be merged.
+
+\begin{abstract}
+Earthquake declustering separates events judged to be background or sequence
+mainshocks from events associated with earlier or later members of an
+earthquake sequence. Different declustering algorithms can produce different
+classifications. In a non-stationary epidemic-type aftershock sequence (ETAS)
+model, these classifications may be used only to initialise a time-varying
+background rate, but it is unclear whether their differences persist after
+likelihood optimisation. This study assessed that sensitivity using 15,207
+earthquakes of magnitude at least 2.0 from a Southern California catalogue
+covering 20 May 2000 to 20 May 2026. Gardner--Knopoff, nearest-neighbour, and
+Reasenberg-style declustering were applied to the same events. Their outputs
+were converted into smooth background-rate starting functions, after which the
+same penalised non-stationary temporal ETAS model was fitted from each start.
+
+The methods classified 17.1\%, 30.1\%, and 25.3\% of events, respectively, as
+background-like, and 16.5\% of events lacked a unanimous label. Differences
+were especially clear during the intense 2019 sequence. On a common daily
+grid, pairwise mean absolute differences between the smooth starting functions
+reached 0.203 events per day, with correlations as low as 0.302. Nevertheless,
+the optimiser reported successful termination for all three fits, the fitted
+log-likelihoods differed by only 0.121, and the final background-rate
+correlations all exceeded 0.999991. Only 0.38\%--1.17\% of the initial pairwise
+mean absolute differences remained after fitting. A limited specification
+analysis found little change in the triggering-parameter estimates. The
+estimated background functions also remained similar to the baseline function
+($r\geq0.983$), although their shapes were more affected by spline flexibility
+than by the triggering-history length.
+
+For this catalogue and baseline model, the three declustering-derived starting
+functions led to essentially the same fitted ETAS solution. This provides
+practical flexibility when selecting among the three tested procedures to
+initialise a non-stationary ETAS background that is subsequently re-estimated.
+However, it does not establish that other declustering algorithms, model
+specifications, or arbitrary starting values would be interchangeable, nor
+that declustering is unimportant when the event classifications themselves are
+of scientific interest.
+\end{abstract}
+
+\section{Introduction}
+\label{sec:introduction}
+
+Earthquake catalogues record the times, locations, depths, and magnitudes of
+detected seismic events. They provide the observational basis for estimating
+seismicity rates, studying earthquake sequences, and constructing statistical
+forecasting and hazard models. Two features make such catalogues statistically
+challenging. First, earthquakes are not independent: one event can be followed
+by an elevated rate of later events. Second, the recorded rate can change for
+reasons other than earthquake-to-earthquake triggering, including changes in
+the underlying seismic process and in the ability of a monitoring network to
+detect small events. A useful model must therefore distinguish temporal
+clustering from slower variation in the rate that remains after clustering has
+been accounted for.
+
+Catalogue completeness is an important preliminary consideration. The
+magnitude of completeness, $M_c$, is the threshold above which events are
+treated as sufficiently reliably detected for a specified region and time
+period. If smaller events are missed, particularly during a dense sequence,
+the apparent event rate and the inferred links between earthquakes can both be
+distorted. Methods based on the Gutenberg--Richter frequency--magnitude
+relationship assess whether the observed magnitude distribution has reached
+the approximately exponential form expected above $M_c$
+\citep{gutenberg1944frequency,wiemer2000minimum,woessner2005assessing}.
+Comparative work shows that the performance of catalogue-based estimators can
+vary when completeness is heterogeneous, so a single catalogue-wide threshold
+should be treated as an operational modelling choice rather than a guarantee
+of uniform detection through time \citep{wang2025magnitude}. This issue is
+particularly relevant here because the study period includes the 2019
+Ridgecrest sequence, whose magnitude 7.1 mainshock was followed by unusually
+intense recorded activity \citep{ross2019hierarchical}.
+
+Earthquake declustering attempts to separate events that appear to form
+dependent sequences from events treated as background or as the principal
+event of a sequence. The resulting labels are algorithmic classifications,
+not directly observed causal categories. Common approaches embody different
+definitions of proximity. Gardner--Knopoff uses magnitude-dependent spatial
+and temporal windows \citep{gardner1974}; Reasenberg's approach constructs and
+updates groups of potentially interacting events \citep{reasenberg1985}; and
+nearest-neighbour methods use a combined time--space--magnitude distance to
+identify unusually close event pairs \citep{zaliapin2013,zaliapin2020declustering}.
+These distinctions matter because the algorithms need not identify the same
+events as background-like.
+
+Comparative studies have found that both the chosen algorithm and its parameter
+settings can change the number and characteristics of events retained after
+declustering \citep{perry2024comparative}. Such choices can also alter the
+estimated Gutenberg--Richter $b$-value, which describes the relative frequency
+of smaller and larger earthquakes \citep{mizrahi2021effect}. Recent work
+comparing deterministic cluster structures with probabilities from an ETAS
+model further emphasises that the two frameworks answer related but different
+questions: deterministic procedures assign sequence labels, whereas ETAS
+represents each event through model-based background and triggering
+contributions \citep{spassiani2025reconciling}. Agreement between methods
+should therefore not be assumed, and a high overall proportion of matching
+labels can be misleading when one class is much more common than the other.
+
+The epidemic-type aftershock sequence (ETAS) model addresses temporal
+dependence by treating earthquake occurrence as a self-exciting point process
+\citep{ogata1988statistical}. Its conditional event rate is the sum of a
+background component and contributions from earlier earthquakes. Larger
+events can produce larger triggering contributions, and each contribution
+decays with elapsed time. In this statistical decomposition, ``background''
+means the part of the fitted rate not attributed to the modelled influence of
+earlier catalogue events; it should not be interpreted as an observed physical
+status for an individual earthquake. A stationary temporal ETAS model assumes
+that this background rate is constant. A non-stationary model relaxes that
+assumption and allows the background rate to vary with time, for example by
+representing it with splines and controlling excessive variation through a
+roughness penalty \citep{kumazawa2014nonstationary,kattamanchi2017nonstationary}.
+
+Declustering and ETAS can be connected in more than one way. ETAS itself can be
+used for probabilistic declustering, with background and parent probabilities
+estimated from the fitted branching structure \citep{zhuang2002stochastic}.
+Alternatively, a conventional declustering calculation can provide a
+preliminary estimate of the background rate before an ETAS model is fitted to
+the complete event catalogue \citep{ogata1998space,zhuang2002stochastic}. In
+the latter use, declustering does not determine which events enter the final
+likelihood. It supplies initial parameter values for a numerical optimiser,
+which then re-estimates both the background and triggering components from all
+included events.
+
+This distinction creates an optimisation question. ETAS likelihoods can be
+difficult to optimise because background and triggering parameters are
+interdependent, and numerical performance can depend on parameterisation and
+starting values \citep{veen2008estimation,lombardi2015simulated}. Existing
+work therefore establishes two separate concerns: alternative declustering
+methods can produce different catalogues or event labels, and ETAS estimation
+can be sensitive to numerical fitting choices. What remains less clear is
+whether scientifically plausible differences between declustering methods
+persist when they enter only as alternative initial background functions for
+the same penalised non-stationary ETAS likelihood. Most declustering
+comparisons study the resulting catalogues or compare deterministic labels
+with ETAS probabilities; they do not isolate initialisation while holding the
+events, likelihood, model structure, and all other starting values fixed.
+
+This study addresses that narrower gap using the Southern California
+Earthquake Data Center catalogue from 20 May 2000 to 20 May 2026
+\citep{scedc2013,scedc_catalog_search2026}. The research question is: \emph{how
+sensitive are fitted non-stationary temporal ETAS estimates to background-rate
+initialisations derived from different declustering methods when the input
+events and all other modelling choices are held constant?} Three contrasting
+declustering schemes---Gardner--Knopoff, a deterministic nearest-neighbour
+construction, and a Reasenberg-style interaction method---are compared at the
+event-classification level. Their background-like events are then converted
+into monthly rates and smooth spline starting functions. Finally, the same
+penalised temporal ETAS model is fitted from each start, allowing the analysis
+to trace differences from event labels, through the actual optimiser inputs,
+to the final fitted background and triggering parameters. A limited
+specification analysis examines whether the main parameter estimates also
+change under moderate variations in spline flexibility and triggering-history
+length.
+
+The contribution is therefore methodological rather than a claim that one
+declustering algorithm is correct. The controlled design distinguishes
+disagreement in the original classifications from sensitivity of the final
+model fit, while class-specific agreement measures and like-for-like curve
+comparisons quantify where discrepancies arise and how much remains after
+optimisation. Section~\ref{sec:methods} describes the catalogue,
+completeness assessment, declustering implementations, construction of the
+initial background functions, and ETAS model. Section~\ref{sec:results}
+reports the classification, initialisation, fitted-model, and robustness
+results. Section~\ref{sec:discussion} interprets the findings in relation to
+previous declustering and non-stationary ETAS work and discusses their scope
+and limitations.
